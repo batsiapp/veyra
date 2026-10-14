@@ -172,6 +172,18 @@ impl AppState {
         self
     }
 
+    /// Puts the read-through market cache (`market::cache`) in front of the
+    /// configured feed, placing bar closes with this state's broker-clock
+    /// memory. Production calls this once at startup, after `with_market`;
+    /// tests that script a feed's answers tick by tick leave it off.
+    pub fn with_market_cache(mut self) -> Self {
+        let memory = self.terminal_memory.clone();
+        self.market = self
+            .market
+            .map(|market| market.cached(Arc::new(move || memory.offset_secs())));
+        self
+    }
+
     /// Pins the wall clock so window-dependent behaviour is deterministic in
     /// tests; production never calls this and reads the real clock.
     pub fn with_fixed_now(mut self, now: Option<std::time::SystemTime>) -> Self {

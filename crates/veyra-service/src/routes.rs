@@ -489,7 +489,7 @@ pub(crate) async fn account_facts_for_draft(
     // broker lookup can take seconds; reading the book last minimizes the
     // window between dynamic risk facts and final order admission.
     let spec = if let Some(market) = state.market() {
-        market.feed().symbol_spec(draft.symbol()).await.ok()
+        market.feed().fresh_symbol_spec(draft.symbol()).await.ok()
     } else {
         None
     };

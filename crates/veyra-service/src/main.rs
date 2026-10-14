@@ -148,6 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_runtime_config(runtime_config)
         .with_credential_vault(vault)
         .with_market(market)
+        .with_market_cache()
         .with_calendar(calendar)
         .with_autopilot(autopilot)
         .with_jev(jev)

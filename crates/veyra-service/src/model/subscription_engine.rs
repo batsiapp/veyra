@@ -10,8 +10,10 @@
 //! and it can lead the subscription-first composite with the single model from
 //! `VEYRA_MODEL_CHATGPT_MODEL`. A refresh the provider rejects marks it as
 //! needing to be reconnected, which takes it out of every route until the
-//! operator reconnects. The Claude Code subscription keeps its original
-//! request loop and is not affected by cooldowns or preference.
+//! operator reconnects. The Claude Code subscription joins the same composite
+//! after ChatGPT, with the single model from `VEYRA_MODEL_CLAUDE_MODEL`; there
+//! its candidates share the route's cooldowns. Selected as the provider
+//! itself, it keeps its original request loop without cooldowns.
 
 use std::fmt;
 use std::sync::Arc;
@@ -111,6 +113,21 @@ impl SubscriptionEngine {
     pub fn build_chatgpt(model: &str, app: &AppState) -> Result<Self, ModelError> {
         Self::assemble(
             SubscriptionProvider::Codex,
+            super::settings::TierModels::new(model, model, model),
+            app,
+        )
+    }
+
+    /// Builds the Claude subscription leg of the subscription-first route,
+    /// with `model` for every tier, as [`SubscriptionEngine::build_chatgpt`]
+    /// does for ChatGPT.
+    ///
+    /// # Errors
+    /// Returns [`ModelError::Construction`] when the subscription is not
+    /// connected or encrypted storage is missing.
+    pub fn build_claude(model: &str, app: &AppState) -> Result<Self, ModelError> {
+        Self::assemble(
+            SubscriptionProvider::ClaudeCode,
             super::settings::TierModels::new(model, model, model),
             app,
         )

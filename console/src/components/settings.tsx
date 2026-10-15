@@ -63,6 +63,7 @@ const SETTING_GROUPS: Array<{ title: string; prefixes: string[]; names: string[]
       'VEYRA_MODEL_PROVIDER',
       'VEYRA_MODEL_PREFER_SUBSCRIPTION',
       'VEYRA_MODEL_CHATGPT_MODEL',
+      'VEYRA_MODEL_CLAUDE_MODEL',
       'VEYRA_MODEL_FAST',
       'VEYRA_MODEL_BALANCED',
       'VEYRA_MODEL_REASONING',
@@ -167,8 +168,9 @@ const SETTING_HELP: Record<string, string> = {
   VEYRA_MODEL_MAX_CALLS_PER_DAY:
     'Most model calls allowed per day; beyond it, calls are refused until the window resets. Empty or 0 means unlimited.',
   VEYRA_MODEL_PREFER_SUBSCRIPTION:
-    'While a ChatGPT subscription is signed in, every model call tries it first; the provider above takes over when it fails.',
+    'Signed-in subscriptions answer every model call first, ChatGPT then Claude; the provider above takes over when they fail.',
   VEYRA_MODEL_CHATGPT_MODEL: 'Model used on the ChatGPT subscription for every tier; empty means gpt-6-luna.',
+  VEYRA_MODEL_CLAUDE_MODEL: 'Model used on the Claude subscription for every tier; empty means claude-sonnet-5-5.',
   VEYRA_MODEL_COMPEL_STRUCTURED:
     'Requires the model to answer in the structured format instead of merely offering it. Turn off for reasoning models, which refuse it.',
   VEYRA_MODEL_PROVIDER:

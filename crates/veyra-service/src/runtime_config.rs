@@ -79,9 +79,10 @@ const SETTABLE: &[&str] = &[
     "VEYRA_MODEL_APP_HIDDEN",
     "VEYRA_MODEL_MAX_CALLS_PER_HOUR",
     "VEYRA_MODEL_MAX_CALLS_PER_DAY",
-    // Routing only: a connected ChatGPT subscription first, with its model.
+    // Routing only: connected subscriptions first, each with its model.
     "VEYRA_MODEL_PREFER_SUBSCRIPTION",
     "VEYRA_MODEL_CHATGPT_MODEL",
+    "VEYRA_MODEL_CLAUDE_MODEL",
     // ---- Jev ----
     "VEYRA_JEV_PROVIDER",
     "VEYRA_JEV_BASE_URL",
@@ -566,6 +567,7 @@ pub(crate) mod test_support {
             ("VEYRA_MODEL_MAX_CALLS_PER_DAY", ""),
             ("VEYRA_MODEL_PREFER_SUBSCRIPTION", ""),
             ("VEYRA_MODEL_CHATGPT_MODEL", ""),
+            ("VEYRA_MODEL_CLAUDE_MODEL", ""),
         ]
         .into_iter()
         .map(|(name, value)| (name.to_owned(), value.to_owned()))
@@ -780,6 +782,7 @@ mod tests {
         for name in [
             "VEYRA_MODEL_PREFER_SUBSCRIPTION",
             "VEYRA_MODEL_CHATGPT_MODEL",
+            "VEYRA_MODEL_CLAUDE_MODEL",
         ] {
             assert!(is_settable(name), "{name}");
             assert!(

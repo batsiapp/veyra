@@ -306,9 +306,14 @@ pub async fn complete_model_subscription(
     };
     let credential = match crate::subscription_auth::exchange(&client, &pending, &code).await {
         Ok(credential) => credential,
-        Err(_) => {
+        Err(error) => {
+            // The reason names the provider's own refusal (never the code or
+            // a token), so the operator can tell an expired code from an
+            // unreachable service.
+            let reason = format!("{error:#}");
+            tracing::warn!(provider = provider.as_str(), %reason, "subscription exchange failed");
             return HttpResponse::BadGateway()
-                .json(json!({"error": "subscription_exchange_failed"}));
+                .json(json!({"error": "subscription_exchange_failed", "reason": reason}));
         }
     };
     let Some(vault) = state.credential_vault() else {

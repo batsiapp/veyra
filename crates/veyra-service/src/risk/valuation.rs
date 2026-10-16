@@ -270,33 +270,77 @@ pub struct FactorMove {
     pub after: f64,
 }
 
-/// The net exposure to each asset `draft` trades, before and after it.
+/// Signed lots one position or draft holds in `asset` through its legs.
+fn held_in(asset: &str, symbol: &Symbol, side: Side, lots: f64) -> f64 {
+    exposure_legs(symbol)
+        .into_iter()
+        .filter(|(leg, _)| leg == asset)
+        .map(|(_, sign)| sign * side_sign(side) * lots)
+        .sum()
+}
+
+/// The net exposure to each asset that `lots` of `symbol` on `side` trades,
+/// before and after it is added to the book.
 ///
 /// Every open position counts through all of its legs, so four AUD crosses
 /// are one AUD bet however they are quoted, and long EURUSD plus long USDJPY
 /// cancel on the dollar while staying long EUR and short JPY.
-pub fn factor_moves(positions: &[PositionFact], draft: &TradeIntentDraft) -> Vec<FactorMove> {
-    let lots = side_sign(draft.side()) * draft.volume().value();
-    exposure_legs(draft.symbol())
+pub fn factor_moves(
+    positions: &[PositionFact],
+    symbol: &Symbol,
+    side: Side,
+    lots: f64,
+) -> Vec<FactorMove> {
+    exposure_legs(symbol)
         .into_iter()
-        .map(|(asset, sign)| {
+        .map(|(asset, _)| {
             let before = positions
                 .iter()
-                .flat_map(|position| {
-                    let held = side_sign(position.side) * position.lots;
-                    exposure_legs(&position.symbol)
-                        .into_iter()
-                        .filter(|(leg, _)| *leg == asset)
-                        .map(move |(_, leg_sign)| leg_sign * held)
-                })
+                .map(|position| held_in(&asset, &position.symbol, position.side, position.lots))
                 .sum::<f64>();
             FactorMove {
-                after: before + sign * lots,
+                after: before + held_in(&asset, symbol, side, lots),
                 before,
                 asset,
             }
         })
         .collect()
+}
+
+/// Slack allowed when comparing summed lot volumes against the cap.
+const FACTOR_EPSILON: f64 = 1e-9;
+
+/// Whether `lots` of `symbol` on `side` would take the net exposure to any
+/// asset it trades past `cap` lots. Only an exposure the trade grows counts,
+/// so a trade that unwinds part of a stacked bet never breaches, even while
+/// the book is over the cap. A cap of zero or less is disabled.
+pub fn breaches_factor_cap(
+    positions: &[PositionFact],
+    symbol: &Symbol,
+    side: Side,
+    lots: f64,
+    cap: f64,
+) -> bool {
+    cap > 0.0
+        && factor_moves(positions, symbol, side, lots)
+            .iter()
+            .any(|motion| {
+                motion.after.abs() > cap + FACTOR_EPSILON
+                    && motion.after.abs() > motion.before.abs() + FACTOR_EPSILON
+            })
+}
+
+/// Net lots the book holds in every asset it is exposed to, by asset code,
+/// leaving out assets whose legs cancel exactly.
+pub fn book_exposure(positions: &[PositionFact]) -> std::collections::BTreeMap<String, f64> {
+    let mut net = std::collections::BTreeMap::<String, f64>::new();
+    for position in positions {
+        for (asset, sign) in exposure_legs(&position.symbol) {
+            *net.entry(asset).or_default() += sign * side_sign(position.side) * position.lots;
+        }
+    }
+    net.retain(|_, lots| lots.abs() > FACTOR_EPSILON);
+    net
 }
 
 #[cfg(test)]
@@ -540,13 +584,18 @@ mod tests {
     }
 
     fn moves(positions: &[PositionFact], draft: &TradeIntentDraft) -> Vec<(String, f64, f64)> {
-        factor_moves(positions, draft)
-            .into_iter()
-            .map(|motion| {
-                let round = |lots: f64| (lots * 1e6).round() / 1e6;
-                (motion.asset, round(motion.before), round(motion.after))
-            })
-            .collect()
+        factor_moves(
+            positions,
+            draft.symbol(),
+            draft.side(),
+            draft.volume().value(),
+        )
+        .into_iter()
+        .map(|motion| {
+            let round = |lots: f64| (lots * 1e6).round() / 1e6;
+            (motion.asset, round(motion.before), round(motion.after))
+        })
+        .collect()
     }
 
     #[test]
@@ -629,5 +678,61 @@ mod tests {
             moves(&book, &draft("Nd100m", Side::Sell, 0.02, None, None)),
             [("ND100M".into(), 0.0, -0.02)]
         );
+    }
+
+    #[test]
+    fn the_cap_refuses_only_exposure_a_trade_grows() {
+        let book = [
+            position("AUDCHF", Side::Sell, 0.01),
+            position("GBPAUD", Side::Buy, 0.01),
+        ];
+        let audcad = symbol("AUDCAD");
+        assert!(breaches_factor_cap(&book, &audcad, Side::Sell, 0.01, 0.02));
+        assert!(!breaches_factor_cap(&book, &audcad, Side::Buy, 0.01, 0.02));
+        assert!(!breaches_factor_cap(&book, &audcad, Side::Sell, 0.01, 0.03));
+        assert!(
+            !breaches_factor_cap(&book, &audcad, Side::Sell, 0.01, 0.0),
+            "a zero cap is off"
+        );
+        // Over the cap already: shrinking passes, growing does not.
+        let over = [
+            position("AUDCHF", Side::Sell, 0.02),
+            position("AUDJPY", Side::Sell, 0.02),
+        ];
+        assert!(!breaches_factor_cap(
+            &over,
+            &symbol("AUDNZD"),
+            Side::Buy,
+            0.01,
+            0.02
+        ));
+        assert!(breaches_factor_cap(
+            &over,
+            &symbol("NZDCHF"),
+            Side::Sell,
+            0.01,
+            0.02
+        ));
+    }
+
+    #[test]
+    fn the_book_reports_its_net_lots_per_asset() {
+        let book = [
+            position("AUDCAD", Side::Sell, 0.01),
+            position("AUDCHF", Side::Sell, 0.01),
+            position("CHFJPY", Side::Buy, 0.01),
+            position("USDCAD", Side::Buy, 0.01),
+        ];
+        let net = book_exposure(&book);
+        let rounded: Vec<(&str, f64)> = net
+            .iter()
+            .map(|(asset, lots)| (asset.as_str(), (lots * 1e6).round() / 1e6))
+            .collect();
+        // CAD: +0.01 from the AUDCAD short, -0.01 from the USDCAD long.
+        assert_eq!(
+            rounded,
+            [("AUD", -0.02), ("CHF", 0.02), ("JPY", -0.01), ("USD", 0.01)]
+        );
+        assert!(book_exposure(&[]).is_empty());
     }
 }

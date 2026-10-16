@@ -497,14 +497,13 @@ impl RiskGate {
         // Every asset the draft trades is held to the cap, but only a draft
         // that grows an exposure is refused: a trade that unwinds part of a
         // stacked bet is always allowed, even while the book is over the cap.
-        if policy.max_net_factor_lots() > 0.0
-            && valuation::factor_moves(&account.open_positions, draft)
-                .iter()
-                .any(|motion| {
-                    motion.after.abs() > policy.max_net_factor_lots() + EXPOSURE_EPSILON
-                        && motion.after.abs() > motion.before.abs() + EXPOSURE_EPSILON
-                })
-        {
+        if valuation::breaches_factor_cap(
+            &account.open_positions,
+            draft.symbol(),
+            draft.side(),
+            draft.volume().value(),
+            policy.max_net_factor_lots(),
+        ) {
             return Err(RiskCode::FactorExposureAboveLimit);
         }
         Ok(())

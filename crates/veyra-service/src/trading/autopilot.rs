@@ -52,11 +52,12 @@ use crate::jev::{
 };
 use crate::market::{Candle, CandleRequest, CandleSeries, Timeframe};
 use crate::model::ModelTier;
+use crate::risk::valuation;
 use crate::risk::window::WeekendPrep;
 use crate::risk::{AccountFacts, RiskPolicy, WeekendPositions};
 use crate::trading::agent::{self, AgentDecision, AgentMode, AgentSession};
 use crate::trading::contract;
-use crate::trading::intent::TradeIntentDraft;
+use crate::trading::intent::{Side, TradeIntentDraft};
 use crate::trading::pipeline::{PipelineError, PipelineOutcome};
 
 /// Default proposal cadence in seconds.
@@ -79,6 +80,9 @@ const DEFAULT_BARS: u16 = 48;
 const MIN_BARS: u16 = 10;
 /// How many recent candles are embedded in the model input.
 const RECENT_CANDLES: usize = 12;
+/// Volume used to probe the exposure cap for an instrument whose contract
+/// does not report its minimum lot.
+const SMALLEST_PROBE_LOTS: f64 = 0.01;
 /// True-range window used for the ATR context handed to the model.
 const ATR_PERIOD: usize = 14;
 /// How far ahead the model sees scheduled events, in seconds.
@@ -1162,6 +1166,7 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
             &specs,
             &events,
             unix_secs(state.now()),
+            policy.max_net_factor_lots(),
         );
         let instructions =
             proposal_instructions(state, &entry_markets, &account, state.jev().is_some());
@@ -4049,6 +4054,12 @@ fn market_narrative(series: &CandleSeries) -> String {
 }
 
 /// Assembles the structured model input for one proposal.
+///
+/// With the per-currency exposure cap on (`factor_cap` lots), the input also
+/// carries the book's net lots per asset and, on each instrument, the sides
+/// the cap would refuse at the smallest tradable volume, so the model does not
+/// spend an answer on an entry the gate is certain to reject.
+#[allow(clippy::too_many_arguments)]
 fn proposal_input(
     markets: &[(Symbol, CandleSeries)],
     judgements: &[(Symbol, Value)],
@@ -4057,6 +4068,7 @@ fn proposal_input(
     specs: &[(Symbol, SymbolSpecPayload)],
     events: &[CalendarEvent],
     now: i64,
+    factor_cap: f64,
 ) -> String {
     let assets: Vec<Value> = markets
         .iter()
@@ -4147,11 +4159,35 @@ fn proposal_input(
                     "take_profit": position.take_profit
                 });
             }
+            if factor_cap > 0.0 {
+                // The smallest order the venue takes: if the cap refuses even
+                // that, it refuses every size on this side.
+                let smallest = symbol_spec_for(specs, symbol.as_str())
+                    .map(|spec| spec.lot_min)
+                    .filter(|lots| *lots > 0.0)
+                    .unwrap_or(SMALLEST_PROBE_LOTS);
+                let refused: Vec<&str> = [Side::Buy, Side::Sell]
+                    .into_iter()
+                    .filter(|side| {
+                        valuation::breaches_factor_cap(
+                            &account.open_positions,
+                            symbol,
+                            *side,
+                            smallest,
+                            factor_cap,
+                        )
+                    })
+                    .map(Side::as_str)
+                    .collect();
+                if !refused.is_empty() {
+                    asset["exposure_refuses"] = json!(refused);
+                }
+            }
             asset
         })
         .collect();
 
-    json!({
+    let mut input = json!({
         "timeframe": markets
             .first()
             .map(|(_, series)| series.timeframe().as_str())
@@ -4168,8 +4204,16 @@ fn proposal_input(
                 .map(|symbol| symbol.as_str())
                 .collect::<Vec<_>>()
         }
-    })
-    .to_string()
+    });
+    if factor_cap > 0.0 {
+        let net_lots: serde_json::Map<String, Value> =
+            valuation::book_exposure(&account.open_positions)
+                .into_iter()
+                .map(|(asset, lots)| (asset, json!((lots * 10_000.0).round() / 10_000.0)))
+                .collect();
+        input["exposure"] = json!({ "cap_lots": factor_cap, "net_lots": net_lots });
+    }
+    input.to_string()
 }
 
 /// Assembles the analyst instructions, including the enforced volume cap.
@@ -4186,7 +4230,7 @@ fn proposal_instructions(
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "You are the analyst for Veyra, a systematic multi-asset trading bot. You are given a menu of          instruments ({menu}) with recent {timeframe} candles{judged_inputs}; the last          candle of each block is the most recent closed bar.\n         Decide for each instrument independently whether the evidence justifies opening a position right          now. You may open at most one instrument per answer. If none of them is suitable, answer `none`          \u{2014} skipping is normal and expected, and every instrument is reconsidered on the next tick.\n         Use the symbol exactly as written. Constraints: at most {max_orders} open orders and {max_total}          lots total exposure ({open_lots} lots currently open), one position per instrument, and volume at          most {max_volume} lots. If you open, use a market order \u{2014} omit `price` entirely \u{2014} with          both `stop_loss` and `take_profit` as absolute prices bracketing the entry, and stay within the          instrument's own price scale. Omit `comment` entirely (the bot annotates orders itself). A          deterministic risk gate re-validates everything and will reject anything outside these limits;          rejections are expected outcomes, not errors. Each asset reports its venue contract \u{2014} spread and stop level in points, lot band and step, margin per lot \u{2014} plus ATR(14); size the volume and stop distance so the order lands on the lot grid, fits the free margin shown in the account block, and keeps the stop outside the spread and the minimum stop level. High-impact events blackout entries for their currencies around the release, and the risk gate enforces that window itself; the `upcoming_events` list shows what is scheduled. A release more than about an hour away is not a reason to skip a setup that otherwise qualifies: the attached stop caps the risk through it. Weigh an event only when it is due within the next hour or so. Always include a short `rationale` (at most 280 characters) explaining why this instrument and direction `-` or, when answering none, why no instrument qualifies; the operator sees it in the decision journal. Before answering you may call read-only tools: {judgement_tool}get_market(symbol, timeframe?, bars?) for another window, get_account(), get_positions(), get_market_window() for session and rollover state, and check_risk(intent) to dry-run a draft through the deterministic gate. Call a tool only when its result would change your decision; otherwise answer none or open.",
+        "You are the analyst for Veyra, a systematic multi-asset trading bot. You are given a menu of          instruments ({menu}) with recent {timeframe} candles{judged_inputs}; the last          candle of each block is the most recent closed bar.\n         Decide for each instrument independently whether the evidence justifies opening a position right          now. You may open at most one instrument per answer. If none of them is suitable, answer `none`          \u{2014} skipping is normal and expected, and every instrument is reconsidered on the next tick.\n         Use the symbol exactly as written. Constraints: at most {max_orders} open orders and {max_total}          lots total exposure ({open_lots} lots currently open), one position per instrument, and volume at          most {max_volume} lots. If you open, use a market order \u{2014} omit `price` entirely \u{2014} with          both `stop_loss` and `take_profit` as absolute prices bracketing the entry, and stay within the          instrument's own price scale. Omit `comment` entirely (the bot annotates orders itself). A          deterministic risk gate re-validates everything and will reject anything outside these limits;          rejections are expected outcomes, not errors.{exposure_rule} Each asset reports its venue contract \u{2014} spread and stop level in points, lot band and step, margin per lot \u{2014} plus ATR(14); size the volume and stop distance so the order lands on the lot grid, fits the free margin shown in the account block, and keeps the stop outside the spread and the minimum stop level. High-impact events blackout entries for their currencies around the release, and the risk gate enforces that window itself; the `upcoming_events` list shows what is scheduled. A release more than about an hour away is not a reason to skip a setup that otherwise qualifies: the attached stop caps the risk through it. Weigh an event only when it is due within the next hour or so. Always include a short `rationale` (at most 280 characters) explaining why this instrument and direction `-` or, when answering none, why no instrument qualifies; the operator sees it in the decision journal. Before answering you may call read-only tools: {judgement_tool}get_market(symbol, timeframe?, bars?) for another window, get_account(), get_positions(), get_market_window() for session and rollover state, and check_risk(intent) to dry-run a draft through the deterministic gate. Call a tool only when its result would change your decision; otherwise answer none or open.",
         menu = menu,
         timeframe = markets
             .first()
@@ -4205,7 +4249,19 @@ fn proposal_instructions(
             "get_judgements(symbol) for calibrated probabilities, "
         } else {
             ""
-        }
+        },
+        exposure_rule = exposure_rule(policy.max_net_factor_lots()),
+    )
+}
+
+/// The instructions' account of the per-currency exposure cap, or nothing when
+/// the cap is off.
+fn exposure_rule(cap: f64) -> String {
+    if cap <= 0.0 {
+        return String::new();
+    }
+    format!(
+        " Exposure is counted per currency or asset: a position is long the first half of its symbol and short the second (short AUDCAD is short AUD and long CAD; long XAUUSD is long gold and short USD), and the gate refuses an entry that would push the net lots on any one of them beyond {cap} lots. `exposure.net_lots` is the book's net position in each, and an instrument's `exposure_refuses` lists the sides refused for that reason right now, so do not propose them."
     )
 }
 
@@ -8040,6 +8096,103 @@ mod tests {
             .ea_link()
             .expect("link");
         assert!(link.has_pending(CommandKind::ModifyOrder));
+    }
+
+    #[actix_web::test]
+    async fn the_model_is_shown_the_exposure_the_cap_counts() {
+        let settings = settings_from(|name| match name {
+            "VEYRA_AUTOPILOT_ENABLED" => Ok("true".to_owned()),
+            "VEYRA_AUTOPILOT_SYMBOLS" => Ok("EURUSD,GBPUSD".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+        });
+        let engine = StubEngine::answering(json!({"action": "none"}));
+        let harness = build_harness(
+            settings,
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        let allowed = vec![
+            Symbol::parse("EURUSD").expect("symbol"),
+            Symbol::parse("GBPUSD").expect("symbol"),
+        ];
+        let policy = |cap: f64| {
+            RiskPolicy::new(
+                false,
+                allowed.clone(),
+                Volume::parse(0.05).expect("volume"),
+                Volume::parse(0.05).expect("volume"),
+                2,
+                Duration::from_secs(60),
+                None,
+            )
+            .with_limits(0.0, 0.0, 0.0, cap)
+        };
+        harness.state.risk().update_policy(policy(0.01));
+        // A manual EURUSD short: short EUR and long USD, outside Veyra's own
+        // book but inside the gate's.
+        let now = unix_secs(test_now());
+        let mut book = managed_snapshot_at(10650805, now - 3_600, now, 1.1490);
+        book.positions[0].magic = 0;
+        harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(book);
+
+        assert_eq!(decision_tick(&harness.state).await, TickOutcome::NoTrade);
+        let requests = engine.requests();
+        let input: Value = serde_json::from_str(&requests[0].input).expect("input is JSON");
+        assert_eq!(
+            input["exposure"],
+            json!({"cap_lots": 0.01, "net_lots": {"EUR": -0.01, "USD": 0.01}})
+        );
+        let refused = |symbol: &str| {
+            input["assets"]
+                .as_array()
+                .expect("assets")
+                .iter()
+                .find(|asset| asset["symbol"] == symbol)
+                .map(|asset| asset["exposure_refuses"].clone())
+                .expect("offered")
+        };
+        // Selling either pair adds a second lot of long USD (and selling
+        // EURUSD a second lot of short EUR); buying unwinds or stays inside.
+        assert_eq!(refused("EURUSD"), json!(["sell"]));
+        assert_eq!(refused("GBPUSD"), json!(["sell"]));
+        assert!(
+            requests[0]
+                .instructions
+                .contains("beyond 0.01 lots. `exposure.net_lots`"),
+            "the instructions state the rule and the cap"
+        );
+
+        // With the cap off, neither the block nor the rule is sent.
+        harness.state.risk().update_policy(policy(0.0));
+        assert_eq!(exposure_rule(0.0), "");
+        let input: Value = serde_json::from_str(&proposal_input(
+            &[],
+            &[],
+            &crate::routes::account_facts(&harness.state)
+                .await
+                .expect("facts"),
+            &[],
+            &[],
+            &[],
+            now,
+            0.0,
+        ))
+        .expect("input is JSON");
+        assert!(input.get("exposure").is_none());
     }
 
     #[actix_web::test]

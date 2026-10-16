@@ -1081,7 +1081,18 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
             atr: average_true_range(series, ATR_PERIOD),
         })
         .collect();
-    if settings.profit_harvest().is_some() {
+    if let Some(harvest) = settings.profit_harvest() {
+        // The position loop records closes on its own cadence, so a stop that
+        // lands just before this sweep may not be in the book yet. Recording
+        // them here first keeps a symbol stopped out moments ago off the menu
+        // instead of handing the model the same trade again.
+        if book_is_complete_and_fresh(state, &settings) {
+            state.profit_harvest_book().observe(
+                &managed_positions(state),
+                unix_secs(state.now()),
+                harvest.reentry_cooldown(),
+            );
+        }
         let pending = state.profit_harvest_book().pending_fresh_baselines();
         if !pending.is_empty() {
             let captured = state.entry_watch().record_symbols(&observations, &pending);
@@ -1426,17 +1437,12 @@ pub async fn manage_open_positions(state: &AppState) -> TickOutcome {
         .unwrap_or(TickOutcome::Unchanged)
 }
 
-async fn manage_open_positions_after_link(
-    state: &AppState,
-    settings: &AutopilotSettings,
-) -> Option<TickOutcome> {
-    let broker = state.broker()?;
-    let managed = managed_positions(state);
-    let snapshot = broker.link().last_account();
-    let server_time = snapshot
-        .as_ref()
-        .map(|snapshot| snapshot.server_time)
-        .unwrap_or(0);
+/// Whether the latest venue book is complete and recent enough to learn from:
+/// an old or truncated snapshot could fabricate a close or a vanished ticket.
+fn book_is_complete_and_fresh(state: &AppState, settings: &AutopilotSettings) -> bool {
+    let Some(broker) = state.broker() else {
+        return false;
+    };
     let max_snapshot_age = Duration::from_secs(
         settings
             .interval()
@@ -1444,14 +1450,28 @@ async fn manage_open_positions_after_link(
             .saturating_mul(2)
             .max(MIN_INTERVAL_SECS),
     );
-    let snapshot_is_complete_and_fresh = snapshot
-        .as_ref()
+    broker
+        .link()
+        .last_account()
         .is_some_and(|snapshot| !snapshot.positions_truncated)
         && broker
             .link()
             .last_account_age(state.now())
-            .is_some_and(|age| age <= max_snapshot_age);
-    if !snapshot_is_complete_and_fresh {
+            .is_some_and(|age| age <= max_snapshot_age)
+}
+
+async fn manage_open_positions_after_link(
+    state: &AppState,
+    settings: &AutopilotSettings,
+) -> Option<TickOutcome> {
+    let broker = state.broker()?;
+    let managed = managed_positions(state);
+    let server_time = broker
+        .link()
+        .last_account()
+        .map(|snapshot| snapshot.server_time)
+        .unwrap_or(0);
+    if !book_is_complete_and_fresh(state, settings) {
         return None;
     }
 
@@ -8020,6 +8040,117 @@ mod tests {
             .ea_link()
             .expect("link");
         assert!(link.has_pending(CommandKind::ModifyOrder));
+    }
+
+    #[actix_web::test]
+    async fn a_stop_out_the_position_loop_has_not_seen_still_cools_the_symbol() {
+        let settings = settings_from(|name| match name {
+            "VEYRA_AUTOPILOT_ENABLED" => Ok("true".to_owned()),
+            "VEYRA_AUTOPILOT_PROFIT_HARVEST" => Ok("true".to_owned()),
+            "VEYRA_AUTOPILOT_SYMBOLS" => Ok("EURUSD,GBPUSD".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+        });
+        let now = unix_secs(test_now());
+        let rig = |engine: Arc<StubEngine>| {
+            let harness = build_harness(
+                settings.clone(),
+                Some(engine),
+                Some(StubFeed {
+                    bars: 20,
+                    fail: false,
+                    spec: None,
+                    spec_fail: false,
+                }),
+                None,
+                true,
+                true,
+            );
+            harness.state.risk().update_policy(RiskPolicy::new(
+                false,
+                vec![
+                    Symbol::parse("EURUSD").expect("symbol"),
+                    Symbol::parse("GBPUSD").expect("symbol"),
+                ],
+                Volume::parse(0.05).expect("volume"),
+                Volume::parse(0.05).expect("volume"),
+                1,
+                Duration::from_secs(60),
+                None,
+            ));
+            harness
+        };
+        let empty_book = || {
+            let mut book = managed_snapshot_at(10650805, now - 3_600, now, 1.1497);
+            book.positions.clear();
+            book.orders = 0;
+            book.lots = 0.0;
+            book
+        };
+        let offered = |engine: &StubEngine| -> Vec<String> {
+            engine
+                .requests()
+                .first()
+                .map(|request| {
+                    let input: Value = serde_json::from_str(&request.input).expect("input is JSON");
+                    input["assets"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|asset| asset["symbol"].as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        // Control: with nothing closed, EURUSD is offered and traded.
+        let control_engine = StubEngine::answering(open_proposal(true, "EURUSD"));
+        let control = rig(control_engine.clone());
+        control
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(empty_book());
+        let outcome = decision_tick(&control.state).await;
+        assert!(matches!(outcome, TickOutcome::Queued { .. }), "{outcome:?}");
+        assert_eq!(offered(&control_engine), ["EURUSD", "GBPUSD"]);
+
+        // The position loop saw the EURUSD short while it was open...
+        let engine = StubEngine::answering(open_proposal(true, "EURUSD"));
+        let harness = rig(engine.clone());
+        let link = harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link");
+        link.retain_snapshot(managed_snapshot_at(10650805, now - 3_600, now, 1.1490));
+        harness.state.profit_harvest_book().observe(
+            &managed_positions(&harness.state),
+            now,
+            Duration::from_secs(900),
+        );
+        // ...then it was stopped out, and the decision sweep runs before the
+        // position loop looks at the book again.
+        link.retain_snapshot(empty_book());
+
+        let outcome = decision_tick(&harness.state).await;
+        assert!(
+            !matches!(outcome, TickOutcome::Queued { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            offered(&engine),
+            ["GBPUSD"],
+            "the symbol just stopped out is not offered again"
+        );
+        assert!(
+            harness
+                .state
+                .profit_harvest_book()
+                .cooling("EURUSD", now + 899)
+        );
     }
 
     #[actix_web::test]

@@ -634,7 +634,7 @@ describe('RiskPanel', () => {
     expect(valueOf('Duplicate window').textContent).toBe('60s')
     expect(valueOf('Max risk').textContent).toBe('12% per trade')
     expect(valueOf('Loss brakes').textContent).toBe('Day 10% · peak 25%')
-    expect(valueOf('Net USD cap').textContent).toBe('0.01 lots')
+    expect(valueOf('Currency cap').textContent).toBe('0.01 lots')
     expect(valueOf('News blackout').textContent).toBe('30m')
     expect(valueOf('Stop floor').textContent).toBe('0.25× ATR')
     expect(valueOf('Judge outage').textContent).toBe('Pauses decisions')
@@ -659,7 +659,7 @@ describe('RiskPanel', () => {
         status={status}
       />,
     )
-    for (const label of ['Max risk', 'Loss brakes', 'Net USD cap', 'News blackout', 'Stop floor']) {
+    for (const label of ['Max risk', 'Loss brakes', 'Currency cap', 'News blackout', 'Stop floor']) {
       expect(valueOf(label).textContent).toBe('Off')
     }
     rerender(<RiskPanel policy={{ ...status.risk_policy, maxDailyLossPercent: 0 }} status={status} />)
@@ -712,7 +712,7 @@ describe('RiskPanel editing', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
     fireEvent.change(screen.getByLabelText('Max open orders'), { target: { value: '7' } })
-    fireEvent.change(screen.getByLabelText('Net USD cap (lots)'), { target: { value: '0.02' } })
+    fireEvent.change(screen.getByLabelText('Currency cap (lots)'), { target: { value: '0.02' } })
     fireEvent.change(screen.getByLabelText('News blackout (minutes)'), { target: { value: '45' } })
     fireEvent.change(screen.getByLabelText('Min stop (× ATR)'), { target: { value: '0.75' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))

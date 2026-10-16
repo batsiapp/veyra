@@ -132,8 +132,8 @@
       `GBPUSD`), read from the reference prices the tick already gathered, so
       the per-trade risk cap prices crosses exactly as it prices majors and
       fails closed (`risk_unverifiable`) when the leg is not in the menu or on
-      the book. Crosses carry no net USD direction — their legs cancel — so
-      they consume none of the directional cap. This makes EURJPY/GBPJPY/
+      the book. For the exposure cap a cross now counts through both of its
+      currencies (see the per-currency cap). This makes EURJPY/GBPJPY/
       AUDJPY and similar crosses *available as options* in the console menu
       without changing any default.
 - [x] Durable runtime state (`runtime_state` in Postgres): judge usage,

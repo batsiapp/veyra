@@ -761,9 +761,9 @@ const POLICY_NUMBER_FIELDS: Array<{ key: NumericDraftKey; label: string; integer
   },
   {
     key: 'maxNetFactorLots',
-    label: 'Net USD cap (lots)',
+    label: 'Currency cap (lots)',
     integer: false,
-    help: 'Cap on net exposure to the US dollar across positions, in lots; 0 turns it off.',
+    help: 'Most lots the book may be net long or short any one currency or asset, counting both sides of every pair; 0 turns it off.',
   },
   {
     key: 'calendarBlackoutMinutes',
@@ -1116,7 +1116,7 @@ export function RiskPanel({
           )}
         />
         <Field
-          label="Net USD cap"
+          label="Currency cap"
           value={view((current) => offOr(current.maxNetFactorLots > 0, `${current.maxNetFactorLots} lots`))}
         />
         <Field

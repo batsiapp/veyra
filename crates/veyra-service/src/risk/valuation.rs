@@ -1,9 +1,10 @@
 //! Position valuation for deterministic risk checks.
 //!
 //! Two questions the gate must answer with numbers rather than vibes: how much
-//! would this draft lose at its stop (as a percentage of equity), and how much
-//! net directional exposure would it add? Both are pure functions of the
-//! draft, the caller-supplied reference prices, and the open book.
+//! would this draft lose at its stop (as a percentage of equity), and how would
+//! it move the net exposure to each currency or asset it trades? Both are pure
+//! functions of the draft, the caller-supplied reference prices, and the open
+//! book.
 //!
 //! Conventions: one standard lot is 100,000 units; a pip is 0.01 for JPY
 //! quotes and 0.0001 otherwise. A pip is worth `pip_size x units` of the quote
@@ -226,25 +227,29 @@ pub fn risk_percent_with_spec(
     Some(loss / equity * 100.0)
 }
 
-/// USD direction of one long lot of `symbol`: +1 longs USD, -1 shorts it,
-/// `None` for instruments this model does not classify. USD-quoted metals
-/// behave like the currency pairs: long gold is short dollars.
-fn usd_sign(symbol: &Symbol) -> Option<f64> {
-    if let Some((base, quote)) = currency_pair(symbol) {
-        return if quote == "USD" {
-            Some(-1.0)
-        } else if base == "USD" {
-            Some(1.0)
-        } else {
-            // A cross is long one non-USD currency against another, so its USD
-            // legs cancel: a long EURJPY is a long EURUSD (short dollars) plus
-            // a short USDJPY (long dollars). It carries no net USD direction
-            // and so consumes none of the directional cap.
-            Some(0.0)
-        };
+/// Codes the second half of a six-letter instrument may be for the instrument
+/// to read as two exposures: fiat currencies (the majors and the exotics
+/// brokers list), the metals, and oil. The first half may be any three
+/// letters, so `AUDCAD`, `USDTRY`, `XAUEUR`, and `BTCUSD` all split.
+const EXPOSURE_QUOTES: &[&str] = &[
+    "USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD", "CNH", "CZK", "DKK", "HKD", "HUF",
+    "MXN", "NOK", "PLN", "RUB", "SEK", "SGD", "TRY", "ZAR", "XAU", "XAG", "OIL",
+];
+
+/// The assets one long lot of `symbol` is long (`+1`) and short (`-1`).
+///
+/// A six-letter code with a known second half is long its first half and
+/// short its second, so a short AUDCAD is short AUD and long CAD, and a long
+/// XAUUSD is long gold and short dollars. Anything else (`SP500m`, a share)
+/// is one exposure to itself.
+fn exposure_legs(symbol: &Symbol) -> Vec<(String, f64)> {
+    if let Some(code) = symbol.six_letter_code() {
+        let (base, quote) = code.split_at(3);
+        if EXPOSURE_QUOTES.contains(&quote) {
+            return vec![(base.to_owned(), 1.0), (quote.to_owned(), -1.0)];
+        }
     }
-    let metal = metal_spec(symbol)?;
-    if metal.quote_is_usd { Some(-1.0) } else { None }
+    vec![(symbol.as_str().to_ascii_uppercase(), 1.0)]
 }
 
 fn side_sign(side: Side) -> f64 {
@@ -254,20 +259,44 @@ fn side_sign(side: Side) -> f64 {
     }
 }
 
-/// Net USD-directional exposure in lots after adding `draft` to the open book
-/// (positive = net long USD). Instruments this model does not classify
-/// contribute nothing.
-pub fn net_usd_lots(positions: &[PositionFact], draft: &TradeIntentDraft) -> f64 {
-    let mut net = 0.0;
-    for position in positions {
-        if let Some(sign) = usd_sign(&position.symbol) {
-            net += sign * side_sign(position.side) * position.lots;
-        }
-    }
-    if let Some(sign) = usd_sign(draft.symbol()) {
-        net += sign * side_sign(draft.side()) * draft.volume().value();
-    }
-    net
+/// How a draft would move the net exposure to one asset it trades.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FactorMove {
+    /// Asset code in upper case (`AUD`, `XAU`, `BTC`, `SP500M`).
+    pub asset: String,
+    /// Net lots on the open book before the draft; positive is net long.
+    pub before: f64,
+    /// Net lots once the draft is added.
+    pub after: f64,
+}
+
+/// The net exposure to each asset `draft` trades, before and after it.
+///
+/// Every open position counts through all of its legs, so four AUD crosses
+/// are one AUD bet however they are quoted, and long EURUSD plus long USDJPY
+/// cancel on the dollar while staying long EUR and short JPY.
+pub fn factor_moves(positions: &[PositionFact], draft: &TradeIntentDraft) -> Vec<FactorMove> {
+    let lots = side_sign(draft.side()) * draft.volume().value();
+    exposure_legs(draft.symbol())
+        .into_iter()
+        .map(|(asset, sign)| {
+            let before = positions
+                .iter()
+                .flat_map(|position| {
+                    let held = side_sign(position.side) * position.lots;
+                    exposure_legs(&position.symbol)
+                        .into_iter()
+                        .filter(|(leg, _)| *leg == asset)
+                        .map(move |(_, leg_sign)| leg_sign * held)
+                })
+                .sum::<f64>();
+            FactorMove {
+                after: before + sign * lots,
+                before,
+                asset,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -502,55 +531,103 @@ mod tests {
         assert!(supports_static_valuation(&symbol("EURUSD")));
     }
 
+    fn position(name: &str, side: Side, lots: f64) -> PositionFact {
+        PositionFact {
+            symbol: symbol(name),
+            side,
+            lots,
+        }
+    }
+
+    fn moves(positions: &[PositionFact], draft: &TradeIntentDraft) -> Vec<(String, f64, f64)> {
+        factor_moves(positions, draft)
+            .into_iter()
+            .map(|motion| {
+                let round = |lots: f64| (lots * 1e6).round() / 1e6;
+                (motion.asset, round(motion.before), round(motion.after))
+            })
+            .collect()
+    }
+
     #[test]
-    fn net_usd_exposure_signs_each_side() {
-        let positions = vec![
-            PositionFact {
-                symbol: symbol("EURUSD"),
-                side: Side::Sell,
-                lots: 0.01,
-            },
-            PositionFact {
-                symbol: symbol("USDJPY"),
-                side: Side::Buy,
-                lots: 0.01,
-            },
+    fn each_side_of_a_pair_is_its_own_exposure() {
+        // Short EURUSD is short EUR and long USD; long USDJPY is long USD and
+        // short JPY.
+        let book = [
+            position("EURUSD", Side::Sell, 0.01),
+            position("USDJPY", Side::Buy, 0.01),
         ];
-        // Short EURUSD is long USD; long USDJPY is long USD.
-        let buy_eur = draft("EURUSD", Side::Buy, 0.01, None, None);
-        let net = net_usd_lots(&positions, &buy_eur);
-        assert!(
-            (net - 0.01).abs() < 1e-9,
-            "0.01 + 0.01 - 0.01 = 0.01, got {net}"
+        assert_eq!(
+            moves(&book, &draft("EURUSD", Side::Buy, 0.01, None, None)),
+            [("EUR".into(), -0.01, 0.0), ("USD".into(), 0.02, 0.01)]
         );
-
-        // Selling the JPY pair reduces the two USD longs.
-        let sell_jpy = draft("USDJPY", Side::Sell, 0.01, None, None);
-        let net = net_usd_lots(&positions, &sell_jpy);
-        assert!((net - 0.01).abs() < 1e-9, "reduces to 0.01, got {net}");
-
-        // Twice the offset flattens the exposure exactly.
-        let flatten = draft("USDJPY", Side::Sell, 0.02, None, None);
-        let net = net_usd_lots(&positions, &flatten);
-        assert!(net.abs() < 1e-9, "flattens exactly, got {net}");
-
-        // A cross carries no net USD direction: its two legs cancel, so it
-        // neither consumes nor frees the directional cap.
-        let cross = draft("EURJPY", Side::Buy, 0.05, None, None);
-        assert!(net_usd_lots(&[], &cross).abs() < 1e-9);
-        assert!(
-            (net_usd_lots(&positions, &cross) - 0.02).abs() < 1e-9,
-            "the book's 0.01 + 0.01 is unchanged by a cross"
+        assert_eq!(
+            moves(&book, &draft("USDJPY", Side::Sell, 0.02, None, None)),
+            [("USD".into(), 0.02, 0.0), ("JPY".into(), -0.01, 0.01)]
         );
+    }
 
-        // Long gold is short dollars, exactly like a USD-quoted pair.
-        let gold = draft("XAUUSD", Side::Buy, 0.01, None, None);
-        let net = net_usd_lots(&[], &gold);
-        assert!((net + 0.01).abs() < 1e-9, "long gold is -USD, got {net}");
+    #[test]
+    fn crosses_stack_on_the_currency_they_share() {
+        // Today's book: four ways of being short the Australian dollar.
+        let book = [
+            position("AUDCHF", Side::Sell, 0.01),
+            position("AUDJPY", Side::Sell, 0.01),
+            position("GBPAUD", Side::Buy, 0.01),
+        ];
+        assert_eq!(
+            moves(&book, &draft("AUDCAD", Side::Sell, 0.01, None, None)),
+            [("AUD".into(), -0.03, -0.04), ("CAD".into(), 0.0, 0.01)]
+        );
+        // A long AUDNZD unwinds part of the AUD short.
+        assert_eq!(
+            moves(&book, &draft("AUDNZD", Side::Buy, 0.01, None, None)),
+            [("AUD".into(), -0.03, -0.02), ("NZD".into(), 0.0, -0.01)]
+        );
+    }
 
-        // An unclassified synthetic contributes nothing.
-        let oil = draft("XAUOIL", Side::Buy, 0.01, None, None);
-        let net = net_usd_lots(&[], &oil);
-        assert_eq!(net, 0.0);
+    #[test]
+    fn exotics_metals_and_coins_split_into_both_assets() {
+        let book = [position("XAUUSD", Side::Buy, 0.01)];
+        assert_eq!(
+            moves(&book, &draft("USDTRY", Side::Sell, 0.01, None, None)),
+            [("USD".into(), -0.01, -0.02), ("TRY".into(), 0.0, 0.01)]
+        );
+        assert_eq!(
+            moves(&book, &draft("BTCUSD", Side::Buy, 0.01, None, None)),
+            [("BTC".into(), 0.0, 0.01), ("USD".into(), -0.01, -0.02)]
+        );
+        assert_eq!(
+            moves(&book, &draft("XAUEUR", Side::Buy, 0.01, None, None)),
+            [("XAU".into(), 0.01, 0.02), ("EUR".into(), 0.0, -0.01)]
+        );
+        assert_eq!(
+            moves(&[], &draft("XAUOIL", Side::Sell, 0.01, None, None)),
+            [("XAU".into(), 0.0, -0.01), ("OIL".into(), 0.0, 0.01)]
+        );
+        // Broker suffixes do not hide the assets.
+        assert_eq!(
+            moves(
+                &[position("AUDUSDm", Side::Sell, 0.01)],
+                &draft("AUDCAD.raw", Side::Sell, 0.01, None, None)
+            ),
+            [("AUD".into(), -0.01, -0.02), ("CAD".into(), 0.0, 0.01)]
+        );
+    }
+
+    #[test]
+    fn an_instrument_without_two_assets_is_its_own_exposure() {
+        let book = [
+            position("SP500m", Side::Buy, 0.01),
+            position("EURUSD", Side::Buy, 0.01),
+        ];
+        assert_eq!(
+            moves(&book, &draft("sp500m", Side::Buy, 0.01, None, None)),
+            [("SP500M".into(), 0.01, 0.02)]
+        );
+        assert_eq!(
+            moves(&book, &draft("Nd100m", Side::Sell, 0.02, None, None)),
+            [("ND100M".into(), 0.0, -0.02)]
+        );
     }
 }

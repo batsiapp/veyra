@@ -124,7 +124,7 @@ pub enum RiskCode {
     DailyLossLimitReached,
     /// Equity is below the peak-drawdown breaker.
     PeakDrawdownLimitReached,
-    /// The net directional exposure would exceed the factor cap.
+    /// The net exposure to one currency or asset would exceed the factor cap.
     FactorExposureAboveLimit,
     /// A high-impact news release for the instrument is inside the blackout.
     NewsBlackout,
@@ -186,7 +186,7 @@ impl RiskCode {
             Self::DailyLossLimitReached => "equity is below the daily-loss breaker",
             Self::PeakDrawdownLimitReached => "equity is below the peak-drawdown breaker",
             Self::FactorExposureAboveLimit => {
-                "net directional exposure would exceed the factor cap"
+                "net exposure to one currency or asset would exceed the factor cap"
             }
             Self::TradingNotAllowed => "the terminal reports trading is not allowed",
             Self::OrderLimitReached => "the venue already holds the maximum tolerated orders",
@@ -494,11 +494,18 @@ impl RiskGate {
                 }
             }
         }
-        if policy.max_net_factor_lots() > 0.0 {
-            let net = valuation::net_usd_lots(&account.open_positions, draft);
-            if net.abs() > policy.max_net_factor_lots() + EXPOSURE_EPSILON {
-                return Err(RiskCode::FactorExposureAboveLimit);
-            }
+        // Every asset the draft trades is held to the cap, but only a draft
+        // that grows an exposure is refused: a trade that unwinds part of a
+        // stacked bet is always allowed, even while the book is over the cap.
+        if policy.max_net_factor_lots() > 0.0
+            && valuation::factor_moves(&account.open_positions, draft)
+                .iter()
+                .any(|motion| {
+                    motion.after.abs() > policy.max_net_factor_lots() + EXPOSURE_EPSILON
+                        && motion.after.abs() > motion.before.abs() + EXPOSURE_EPSILON
+                })
+        {
+            return Err(RiskCode::FactorExposureAboveLimit);
         }
         Ok(())
     }
@@ -1443,6 +1450,82 @@ mod tests {
             ),
             RiskDecision::Approved(_)
         ));
+    }
+
+    #[test]
+    fn net_factor_cap_counts_every_currency_a_cross_trades() {
+        let now = at(10);
+        let names = ["AUDCHF", "AUDJPY", "GBPAUD", "AUDCAD", "AUDNZD", "EURCHF"];
+        let gate = RiskGate::new(
+            RiskPolicy::new(
+                false,
+                names
+                    .iter()
+                    .map(|name| Symbol::parse(name).expect("symbol"))
+                    .collect(),
+                Volume::parse(0.5).expect("volume"),
+                Volume::parse(0.5).expect("volume"),
+                10,
+                Duration::from_secs(60),
+                None,
+            )
+            .with_limits(0.0, 0.0, 0.0, 0.02),
+        );
+        let book = |held: &[(&str, Side)]| {
+            let mut facts = facts_test(u32::try_from(held.len()).expect("count"));
+            for (name, side) in held {
+                let symbol = Symbol::parse(name).expect("symbol");
+                facts.open_symbols.push(symbol.clone());
+                facts.open_positions.push(PositionFact {
+                    symbol,
+                    side: *side,
+                    lots: 0.01,
+                });
+            }
+            facts.open_lots = 0.01 * held.len() as f64;
+            Some(facts)
+        };
+        let short_aud = book(&[("AUDCHF", Side::Sell), ("GBPAUD", Side::Buy)]);
+
+        // Short AUDCHF and long GBPAUD are already 0.02 short AUD, so a third
+        // AUD short is refused although no dollar is involved.
+        let third = draft_sided("AUDCAD", Side::Sell, 0.01, 0.99);
+        assert_eq!(
+            expect_rejection(gate.evaluate(&third, short_aud.clone(), now)).code(),
+            RiskCode::FactorExposureAboveLimit
+        );
+
+        // The other side of the same currency is still open...
+        let unwind = draft_sided("AUDNZD", Side::Buy, 0.01, 1.10);
+        assert!(matches!(
+            gate.evaluate(&unwind, short_aud.clone(), now),
+            RiskDecision::Approved(_)
+        ));
+
+        // ...and so is a trade sharing no stacked currency.
+        let fresh = draft_sided("EURCHF", Side::Sell, 0.01, 0.95);
+        assert!(matches!(
+            gate.evaluate(&fresh, short_aud, now),
+            RiskDecision::Approved(_)
+        ));
+
+        // A book already past the cap (here after the cap was lowered) may
+        // always shrink, but never grow. An hour later, so the approval above
+        // is not a duplicate.
+        let later = at(11);
+        let over = book(&[
+            ("AUDCHF", Side::Sell),
+            ("GBPAUD", Side::Buy),
+            ("AUDJPY", Side::Sell),
+        ]);
+        assert!(matches!(
+            gate.evaluate(&unwind, over.clone(), later),
+            RiskDecision::Approved(_)
+        ));
+        assert_eq!(
+            expect_rejection(gate.evaluate(&third, over, later)).code(),
+            RiskCode::FactorExposureAboveLimit
+        );
     }
 
     #[test]

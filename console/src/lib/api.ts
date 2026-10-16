@@ -118,7 +118,7 @@ export type RiskPolicy = {
   maxDailyLossPercent: number
   /** Peak-drawdown breaker, percent below the lifetime peak. */
   maxPeakDrawdownPercent: number
-  /** Cap on net USD-directional exposure in lots (0 disables). */
+  /** Cap on net exposure to any one currency or asset, in lots (0 disables). */
   maxNetFactorLots: number
   /** News blackout either side of a high-impact event, in minutes (0 disables). */
   calendarBlackoutMinutes: number

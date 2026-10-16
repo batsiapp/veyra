@@ -2779,15 +2779,30 @@ impl EntryWatch {
 }
 
 impl StopBasis {
-    /// Whether a stop within `tolerance` of `stop` was sent for `ticket` less
-    /// than [`STOP_RESEND_HOLD_SECS`] ago.
-    fn recently_attempted(&self, ticket: i64, stop: f64, tolerance: f64, now: i64) -> bool {
+    /// Whether a stop move to `stop` for `ticket` should wait.
+    ///
+    /// It waits for [`STOP_RESEND_HOLD_SECS`] after a move to the same level
+    /// (within `tolerance`), and after a move to any level the venue has not
+    /// applied: while the position's stop (`current_stop`) still sits
+    /// elsewhere, the last move was refused or is in flight, and a trailing
+    /// plan that shifts a little every tick would otherwise be refused again
+    /// every tick. Once a sent level shows on the position, the next move is
+    /// free to go.
+    fn recently_attempted(
+        &self,
+        ticket: i64,
+        stop: f64,
+        current_stop: f64,
+        tolerance: f64,
+        now: i64,
+    ) -> bool {
         let attempts = match self.attempts.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
         attempts.get(&ticket).is_some_and(|(sent, at)| {
-            (sent - stop).abs() <= tolerance && now.saturating_sub(*at) < STOP_RESEND_HOLD_SECS
+            now.saturating_sub(*at) < STOP_RESEND_HOLD_SECS
+                && ((sent - stop).abs() <= tolerance || (sent - current_stop).abs() > tolerance)
         })
     }
 
@@ -3309,9 +3324,11 @@ async fn review_positions(
 /// MT4 refuses (code 130) a stop closer to the current price than the
 /// instrument's stop level, or inside its freeze level. The stop is pulled
 /// back to that distance (plus one tick, so rounding cannot land inside it)
-/// and onto the tick grid, rounding away from the price. `None` means the
-/// fitted stop no longer does its job: it would not improve the current stop,
-/// or a break-even or profit-lock stop would fall below entry.
+/// and onto the tick grid, rounding away from the price. `None` means there is
+/// nothing the venue would accept or nothing worth sending: the price is
+/// inside that distance of the take-profit (which the venue re-checks on every
+/// modify), the fitted stop would not improve the current stop, or a
+/// break-even or profit-lock stop would fall below entry.
 fn fit_to_venue(
     plan: StopMove,
     position: &ManagedPosition,
@@ -3327,6 +3344,18 @@ fn fit_to_venue(
     }
     let distance =
         f64::from(spec.stop_level_points.max(spec.freeze_level_points)) * spec.point + tick;
+    // MT4 checks the whole bracket on every modify, so with the price already
+    // inside that distance of the take-profit any stop change is refused (code
+    // 130), whatever the new stop. Nothing is worth sending until the price
+    // moves back out or the target fills.
+    let target_too_close = position.take_profit > 0.0
+        && match position.side {
+            ManagedSide::Buy => position.take_profit - position.current < distance,
+            ManagedSide::Sell => position.current - position.take_profit < distance,
+        };
+    if target_too_close {
+        return None;
+    }
     // A hair of slack so values already on the grid are not pushed a tick.
     const GRID_SLACK: f64 = 1e-6;
     let stop = match position.side {
@@ -3356,9 +3385,10 @@ fn fit_to_venue(
 }
 
 /// Readies a planned stop move: fitted to the venue's stop level when the
-/// contract can be read, and held back when the same level was sent less than
-/// [`STOP_RESEND_HOLD_SECS`] ago (the venue refused it, or it is still in
-/// flight). `None` means do not send this tick.
+/// contract can be read, and held back for [`STOP_RESEND_HOLD_SECS`] after the
+/// same level was sent, or after any move the position does not show yet (the
+/// venue refused it, or it is still in flight). `None` means do not send this
+/// tick.
 async fn prepare_stop(
     state: &AppState,
     position: &ManagedPosition,
@@ -3388,10 +3418,13 @@ async fn prepare_stop(
         .filter(|tick| tick.is_finite() && *tick > 0.0)
         .unwrap_or_else(|| position.current.abs() * 1e-6);
     let now = unix_secs(state.now());
-    if state
-        .stop_basis()
-        .recently_attempted(plan.ticket, plan.stop, tolerance, now)
-    {
+    if state.stop_basis().recently_attempted(
+        plan.ticket,
+        plan.stop,
+        position.stop_loss,
+        tolerance,
+        now,
+    ) {
         return None;
     }
     state
@@ -7523,29 +7556,84 @@ mod tests {
     #[test]
     fn the_same_stop_is_not_resent_within_the_hold() {
         let basis = StopBasis::default();
+        let old_stop = 1.41180;
         basis.record_attempt(7, 1.41759, 1_000);
-        assert!(basis.recently_attempted(7, 1.41759, 0.00001, 1_000 + 60));
+        assert!(basis.recently_attempted(7, 1.41759, old_stop, 0.00001, 1_000 + 60));
         assert!(
-            basis.recently_attempted(7, 1.417595, 0.00001, 1_000 + 60),
+            basis.recently_attempted(7, 1.417595, old_stop, 0.00001, 1_000 + 60),
             "within a tick"
         );
         assert!(
-            !basis.recently_attempted(7, 1.41790, 0.00001, 1_000 + 60),
-            "a new level goes out"
+            !basis.recently_attempted(7, 1.41790, 1.41759, 0.00001, 1_000 + 60),
+            "once the sent level is applied, a new level goes out"
         );
         assert!(
-            !basis.recently_attempted(8, 1.41759, 0.00001, 1_000 + 60),
+            !basis.recently_attempted(8, 1.41759, old_stop, 0.00001, 1_000 + 60),
             "per ticket"
         );
         assert!(
-            !basis.recently_attempted(7, 1.41759, 0.00001, 1_000 + STOP_RESEND_HOLD_SECS),
+            !basis.recently_attempted(7, 1.41759, old_stop, 0.00001, 1_000 + STOP_RESEND_HOLD_SECS),
             "the hold expires"
         );
         basis.observe(&[]);
         assert!(
-            !basis.recently_attempted(7, 1.41759, 0.00001, 1_000 + 60),
+            !basis.recently_attempted(7, 1.41759, old_stop, 0.00001, 1_000 + 60),
             "closed tickets are forgotten"
         );
+    }
+
+    #[test]
+    fn a_refused_move_holds_every_level_until_the_hold_expires() {
+        // The NZDUSD loop: a trailing plan shifted a few points every tick and
+        // each new level was refused in turn, twice a minute.
+        let basis = StopBasis::default();
+        let old_stop = 0.56619;
+        basis.record_attempt(9, 0.56632, 1_000);
+        for (offset, level) in [(30, 0.56635), (60, 0.56641), (270, 0.56650)] {
+            assert!(
+                basis.recently_attempted(9, level, old_stop, 0.00001, 1_000 + offset),
+                "{level} waits while 0.56632 is not on the position"
+            );
+        }
+        assert!(!basis.recently_attempted(
+            9,
+            0.56650,
+            old_stop,
+            0.00001,
+            1_000 + STOP_RESEND_HOLD_SECS
+        ));
+    }
+
+    #[test]
+    fn no_stop_is_sent_while_the_target_is_inside_the_stop_level() {
+        // NZDUSD on 2026-10-16: bid 0.56698, take-profit 0.5674 (42 points
+        // away) under a 60-point stop level. MT4 refused every stop change.
+        let spec = usdcad_spec();
+        let mut long = managed_position(ManagedSide::Buy, 0.56543, 0.56619, 0.56698);
+        long.take_profit = 0.56740;
+        let plan = StopMove {
+            ticket: 1,
+            stop: 0.56630,
+            kind: StopMoveKind::ProfitHarvest,
+        };
+        assert!(fit_to_venue(plan, &long, &spec).is_none());
+        // With the target 70 points out, the move goes.
+        long.take_profit = 0.56768;
+        assert!(fit_to_venue(plan, &long, &spec).is_some());
+        // No target at all never blocks.
+        long.take_profit = 0.0;
+        assert!(fit_to_venue(plan, &long, &spec).is_some());
+
+        let mut short = managed_position(ManagedSide::Sell, 1.42000, 1.42300, 1.41700);
+        short.take_profit = 1.41650;
+        let lower = StopMove {
+            ticket: 1,
+            stop: 1.41900,
+            kind: StopMoveKind::ProfitHarvest,
+        };
+        assert!(fit_to_venue(lower, &short, &spec).is_none());
+        short.take_profit = 1.41620;
+        assert!(fit_to_venue(lower, &short, &spec).is_some());
     }
 
     fn managed_position_named(symbol: &str) -> ManagedPosition {
@@ -8010,18 +8098,17 @@ mod tests {
             true,
             true,
         );
+        // One R in profit, with the target still ahead of the price: the
+        // fixture's usual 1.14554 target would already have filled at 1.14544.
+        let mut book = managed_snapshot_at(10650805, 1_758_000_000, 1_758_003_600, 1.14544);
+        book.positions[0].take_profit = 1.14300;
         harness
             .state
             .broker()
             .expect("broker")
             .ea_link()
             .expect("link")
-            .retain_snapshot(managed_snapshot_at(
-                10650805,
-                1_758_000_000,
-                1_758_003_600,
-                1.14544,
-            ));
+            .retain_snapshot(book);
 
         match tick(&harness.state).await {
             TickOutcome::StopMoved { command } => assert!(!command.is_empty()),
@@ -8071,18 +8158,16 @@ mod tests {
             true,
         );
         let risk = 1.1497 - 1.14757;
+        let mut book =
+            managed_snapshot_at(10650805, 1_758_000_000, 1_758_003_600, 1.14757 - 2.0 * risk);
+        book.positions[0].take_profit = 1.14000;
         harness
             .state
             .broker()
             .expect("broker")
             .ea_link()
             .expect("link")
-            .retain_snapshot(managed_snapshot_at(
-                10650805,
-                1_758_000_000,
-                1_758_003_600,
-                1.14757 - 2.0 * risk,
-            ));
+            .retain_snapshot(book);
         assert!(matches!(
             tick(&harness.state).await,
             TickOutcome::StopMoved { .. }

@@ -1,6 +1,6 @@
 //! Autonomous trader loop.
 //!
-//! One tick gathers validated market data, optionally asks Jev for calibrated
+//! One tick gathers validated market data, optionally asks Jev for trend
 //! judgements, asks the configured decision engine for a structured proposal,
 //! and routes it through the deterministic risk gate and the same staged
 //! execution path the control surface uses. The loop never widens behavior:
@@ -58,6 +58,7 @@ use crate::risk::{AccountFacts, RiskPolicy, WeekendPositions};
 use crate::trading::agent::{self, AgentDecision, AgentMode, AgentSession};
 use crate::trading::contract;
 use crate::trading::intent::{Side, TradeIntentDraft};
+use crate::trading::judge_record::JudgeRecord;
 use crate::trading::pipeline::{PipelineError, PipelineOutcome};
 
 /// Default proposal cadence in seconds.
@@ -787,7 +788,7 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
     // no open position to quote from.
     let mut account = with_reference_prices(account, &markets);
 
-    // Calibrated judgements per candidate. They are advisory inputs, but a
+    // Jev's trend readings per candidate. They are advisory inputs, but a
     // configured judge that fails normally aborts the tick: no model call runs
     // on partial inputs. The owner can override that from the console, which
     // trades on the model alone rather than pausing through a judge outage.
@@ -1158,6 +1159,11 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
                 return TickOutcome::Unavailable { reason };
             }
         };
+        let judge_record = if judgements.is_empty() {
+            None
+        } else {
+            load_judge_record(state).await
+        };
         let input = proposal_input(
             &entry_markets,
             &judgements,
@@ -1167,9 +1173,15 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
             &events,
             unix_secs(state.now()),
             policy.max_net_factor_lots(),
+            judge_record.as_ref(),
         );
-        let instructions =
-            proposal_instructions(state, &entry_markets, &account, state.jev().is_some());
+        let instructions = proposal_instructions(
+            state,
+            &entry_markets,
+            &account,
+            state.jev().is_some(),
+            judge_record.is_some(),
+        );
         let engine = model.engine();
         let session = AgentSession {
             state,
@@ -3978,8 +3990,10 @@ async fn record_event_context(
         .await;
 }
 
-/// Asks the judgement engine for calibrated answers over the same market
-/// state, returning a compact JSON summary for the model input.
+/// Asks the judgement engine for its trend readings over the same market
+/// state, returning a compact JSON summary for the model input. The judge sees
+/// only [`market_narrative`]'s one-line summary, so a reading restates the move
+/// so far; [`super::judge_record`] scores readings against real results.
 pub(crate) async fn judgements_for(
     jev: &JevRuntime,
     series: &CandleSeries,
@@ -4091,7 +4105,8 @@ fn market_narrative(series: &CandleSeries) -> String {
 /// With the per-currency exposure cap on (`factor_cap` lots), the input also
 /// carries the book's net lots per asset and, on each instrument, the sides
 /// the cap would refuse at the smallest tradable volume, so the model does not
-/// spend an answer on an entry the gate is certain to reject.
+/// spend an answer on an entry the gate is certain to reject. With a judge
+/// record, the input carries it as `judge_record`.
 #[allow(clippy::too_many_arguments)]
 fn proposal_input(
     markets: &[(Symbol, CandleSeries)],
@@ -4102,6 +4117,7 @@ fn proposal_input(
     events: &[CalendarEvent],
     now: i64,
     factor_cap: f64,
+    judge_record: Option<&JudgeRecord>,
 ) -> String {
     let assets: Vec<Value> = markets
         .iter()
@@ -4246,6 +4262,9 @@ fn proposal_input(
                 .collect();
         input["exposure"] = json!({ "cap_lots": factor_cap, "net_lots": net_lots });
     }
+    if let Some(record) = judge_record {
+        input["judge_record"] = record.to_value();
+    }
     input.to_string()
 }
 
@@ -4255,6 +4274,7 @@ fn proposal_instructions(
     markets: &[(Symbol, CandleSeries)],
     account: &AccountFacts,
     judge: bool,
+    judge_record: bool,
 ) -> String {
     let policy = state.risk().policy();
     let menu = markets
@@ -4263,7 +4283,7 @@ fn proposal_instructions(
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "You are the analyst for Veyra, a systematic multi-asset trading bot. You are given a menu of          instruments ({menu}) with recent {timeframe} candles{judged_inputs}; the last          candle of each block is the most recent closed bar.\n         Decide for each instrument independently whether the evidence justifies opening a position right          now. You may open at most one instrument per answer. If none of them is suitable, answer `none`          \u{2014} skipping is normal and expected, and every instrument is reconsidered on the next tick.\n         Use the symbol exactly as written. Constraints: at most {max_orders} open orders and {max_total}          lots total exposure ({open_lots} lots currently open), one position per instrument, and volume at          most {max_volume} lots. If you open, use a market order \u{2014} omit `price` entirely \u{2014} with          both `stop_loss` and `take_profit` as absolute prices bracketing the entry, and stay within the          instrument's own price scale. Omit `comment` entirely (the bot annotates orders itself). A          deterministic risk gate re-validates everything and will reject anything outside these limits;          rejections are expected outcomes, not errors.{exposure_rule} Each asset reports its venue contract \u{2014} spread and stop level in points, lot band and step, margin per lot \u{2014} plus ATR(14); size the volume and stop distance so the order lands on the lot grid, fits the free margin shown in the account block, and keeps the stop outside the spread and the minimum stop level. High-impact events blackout entries for their currencies around the release, and the risk gate enforces that window itself; the `upcoming_events` list shows what is scheduled. A release more than about an hour away is not a reason to skip a setup that otherwise qualifies: the attached stop caps the risk through it. Weigh an event only when it is due within the next hour or so. Always include a short `rationale` (at most 280 characters) explaining why this instrument and direction `-` or, when answering none, why no instrument qualifies; the operator sees it in the decision journal. Before answering you may call read-only tools: {judgement_tool}get_market(symbol, timeframe?, bars?) for another window, get_account(), get_positions(), get_market_window() for session and rollover state, and check_risk(intent) to dry-run a draft through the deterministic gate. Call a tool only when its result would change your decision; otherwise answer none or open.",
+        "You are the analyst for Veyra, a systematic multi-asset trading bot. You are given a menu of          instruments ({menu}) with recent {timeframe} candles{judged_inputs}; the last          candle of each block is the most recent closed bar.{judge_note}\n         Decide for each instrument independently whether the evidence justifies opening a position right          now. You may open at most one instrument per answer. If none of them is suitable, answer `none`          \u{2014} skipping is normal and expected, and every instrument is reconsidered on the next tick.\n         Use the symbol exactly as written. Constraints: at most {max_orders} open orders and {max_total}          lots total exposure ({open_lots} lots currently open), one position per instrument, and volume at          most {max_volume} lots. If you open, use a market order \u{2014} omit `price` entirely \u{2014} with          both `stop_loss` and `take_profit` as absolute prices bracketing the entry, and stay within the          instrument's own price scale. Omit `comment` entirely (the bot annotates orders itself). A          deterministic risk gate re-validates everything and will reject anything outside these limits;          rejections are expected outcomes, not errors.{exposure_rule} Each asset reports its venue contract \u{2014} spread and stop level in points, lot band and step, margin per lot \u{2014} plus ATR(14); size the volume and stop distance so the order lands on the lot grid, fits the free margin shown in the account block, and keeps the stop outside the spread and the minimum stop level. High-impact events blackout entries for their currencies around the release, and the risk gate enforces that window itself; the `upcoming_events` list shows what is scheduled. A release more than about an hour away is not a reason to skip a setup that otherwise qualifies: the attached stop caps the risk through it. Weigh an event only when it is due within the next hour or so. Always include a short `rationale` (at most 280 characters) explaining why this instrument and direction `-` or, when answering none, why no instrument qualifies; the operator sees it in the decision journal. Before answering you may call read-only tools: {judgement_tool}get_market(symbol, timeframe?, bars?) for another window, get_account(), get_positions(), get_market_window() for session and rollover state, and check_risk(intent) to dry-run a draft through the deterministic gate. Call a tool only when its result would change your decision; otherwise answer none or open.",
         menu = menu,
         timeframe = markets
             .first()
@@ -4274,17 +4294,52 @@ fn proposal_instructions(
         open_lots = account.open_lots,
         max_volume = policy.max_volume_per_order().value(),
         judged_inputs = if judge {
-            " and optional calibrated judgements"
+            " and a trend reading for each instrument (`judgements`)"
         } else {
             ""
         },
         judgement_tool = if judge {
-            "get_judgements(symbol) for calibrated probabilities, "
+            "get_judgements(symbol) for an instrument's trend reading, "
         } else {
             ""
         },
         exposure_rule = exposure_rule(policy.max_net_factor_lots()),
+        judge_note = judge_note(judge, judge_record),
     )
+}
+
+/// The instructions' account of what the trend readings are, and of their
+/// record when one is attached; nothing without a judge.
+fn judge_note(judge: bool, record: bool) -> &'static str {
+    match (judge, record) {
+        (false, _) => "",
+        (true, false) => {
+            " The trend readings come from a second model that sees only a one-line summary of each window (first and last close, high, low, change, and the last three closes): `direction` says which way the price has already moved, and its probabilities grow with the size of that move. They describe the move so far; they are not odds that a trade will win."
+        }
+        (true, true) => {
+            " The trend readings come from a second model that sees only a one-line summary of each window (first and last close, high, low, change, and the last three closes): `direction` says which way the price has already moved, and its probabilities grow with the size of that move. They describe the move so far; they are not odds that a trade will win. `judge_record` shows how the trades opened on each band of readings under the current timeframe have actually done: how many won, and their average result in multiples of the risk taken (`average_r`; below zero loses money). Weigh a reading by that record, not by its size."
+        }
+    }
+}
+
+/// Longest wait for the judge record before the entry sweep goes on without it.
+const JUDGE_RECORD_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The judge's record for the entry prompt, or `None` (logged) when it cannot
+/// be read in time: the sweep still runs, the model just sees no record.
+async fn load_judge_record(state: &AppState) -> Option<JudgeRecord> {
+    match actix_web::rt::time::timeout(JUDGE_RECORD_TIMEOUT, super::judge_record::load(state)).await
+    {
+        Ok(Ok(record)) => record,
+        Ok(Err(reason)) => {
+            tracing::warn!(%reason, "judge record unavailable; proposing without it");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("judge record timed out; proposing without it");
+            None
+        }
+    }
 }
 
 /// The instructions' account of the per-currency exposure cap, or nothing when
@@ -5755,8 +5810,20 @@ mod tests {
             requests[0].instructions.contains("get_judgements(symbol)")
                 && requests[0]
                     .instructions
-                    .contains("optional calibrated judgements"),
-            "with a judge the instructions offer judgements"
+                    .contains("a trend reading for each instrument")
+                && requests[0]
+                    .instructions
+                    .contains("they are not odds that a trade will win"),
+            "with a judge the instructions offer the readings for what they are"
+        );
+        assert!(
+            !requests[0].instructions.contains("calibrated"),
+            "nothing calls the readings calibrated"
+        );
+        assert!(
+            input.get("judge_record").is_none()
+                && !requests[0].instructions.contains("judge_record"),
+            "without a ledger there is no record to show"
         );
         assert_eq!(input["assets"][0]["market"]["bars"], 20);
         assert_eq!(
@@ -8184,6 +8251,92 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn the_model_is_shown_how_trades_on_each_reading_have_done() {
+        let settings = settings_from(|name| match name {
+            "VEYRA_AUTOPILOT_ENABLED" => Ok("true".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+        });
+        let engine = StubEngine::answering(json!({"action": "none"}));
+        let judge = StubJudge::responding(judgements_response());
+        let mut harness = build_harness(
+            settings,
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            Some(judge),
+            true,
+            true,
+        );
+        // One earlier EURUSD long, opened on a 0.93 long reading and stopped
+        // out at -1 R.
+        let ledger = Arc::new(crate::ledger::MemoryLedger::default());
+        let now = unix_secs(test_now());
+        crate::ledger::TradeLedger::record_trades(
+            ledger.as_ref(),
+            &[crate::broker::ClosedTradePayload {
+                ticket: 41,
+                symbol: "EURUSD".to_owned(),
+                kind: crate::broker::PositionKind::Buy,
+                lots: 0.01,
+                open_price: 1.1000,
+                close_price: 1.0950,
+                open_time: now - 7_200,
+                close_time: now - 3_600,
+                profit: -2.0,
+                swap: 0.0,
+                commission: 0.0,
+                magic: ORDER_MAGIC,
+            }],
+        )
+        .await
+        .expect("recorded");
+        harness.state = harness.state.clone().with_ledger(Some(ledger));
+        let command = "0d33013f-93a0-4537-b8b9-87f655bd405b";
+        let trail = harness.state.audit().expect("audit").trail().clone();
+        trail
+            .record(AuditEvent::new(
+                AuditKind::ProposalEvaluated,
+                json!({
+                    "outcome": "queued",
+                    "origin": "autopilot",
+                    "symbol": "EURUSD",
+                    "side": "buy",
+                    "stop_loss": 1.0950,
+                    "command_id": command,
+                    "judgements": {"direction": {"probabilities": {"long": 0.93, "short": 0.05, "flat": 0.02}}}
+                }),
+            ))
+            .await
+            .expect("recorded");
+        trail
+            .record(AuditEvent::new(
+                AuditKind::CommandCompleted,
+                json!({"kind": "open_order", "command_id": command, "result": {"ticket": 41, "retcode": 0, "executed": true}}),
+            ))
+            .await
+            .expect("recorded");
+
+        assert_eq!(decision_tick(&harness.state).await, TickOutcome::NoTrade);
+        let request = &engine.requests()[0];
+        let input: Value = serde_json::from_str(&request.input).expect("input is JSON");
+        assert_eq!(input["judge_record"]["scored_trades"], 1);
+        assert_eq!(
+            input["judge_record"]["bands"],
+            json!([{"reading": "0.9 and above", "trades": 1, "won": 0, "average_r": -1.0}])
+        );
+        assert!(
+            request
+                .instructions
+                .contains("Weigh a reading by that record, not by its size."),
+            "the instructions say what the record is for"
+        );
+    }
+
+    #[actix_web::test]
     async fn the_model_is_shown_the_exposure_the_cap_counts() {
         let settings = settings_from(|name| match name {
             "VEYRA_AUTOPILOT_ENABLED" => Ok("true".to_owned()),
@@ -8275,6 +8428,7 @@ mod tests {
             &[],
             now,
             0.0,
+            None,
         ))
         .expect("input is JSON");
         assert!(input.get("exposure").is_none());

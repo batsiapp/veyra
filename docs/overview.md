@@ -4,7 +4,7 @@ Veyra is designed as an unattended trading service rather than a chat applicatio
 
 1. **Runtime configuration** identifies the model/provider, broker adapter, judgement provider, and policy source.
 2. **Context collectors** maintain typed market/account/session state.
-3. **Decision adapters** request structured outputs from the configured model (`DecisionEngine`) and calibrated judgements from Jev (`SemanticJudge`).
+3. **Decision adapters** request structured outputs from the configured model (`DecisionEngine`) and trend readings from Jev (`SemanticJudge`), shown to the model beside their own track record.
 4. **Risk gate** validates proposed orders against hard limits and session rules.
 5. **Broker adapter** carries read-only commands, broker-side validation, and gate-approved open, close, and modify orders.
 6. **Reconciler** verifies actual broker state and persists durable outcomes.

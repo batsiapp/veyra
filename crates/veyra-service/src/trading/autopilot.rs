@@ -46,6 +46,7 @@ use crate::control::{
     StagedClose, StagedExecution, StagedModify, queue_staged_close, queue_staged_modify,
     queue_staged_order,
 };
+use crate::forecast::RangeRequest;
 use crate::jev::{
     Answer, ChoiceOptions, Instructions, JevRequest, JevRuntime, NoulCriteria, Question,
     ScoreLevels, State as JevState,
@@ -832,6 +833,7 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
             }
         }
     }
+    let forecasts = range_forecasts(state, &markets).await;
 
     // One position review per tick, rotating through the open book; a close
     // ends the tick, a hold falls through so entries can still be considered.
@@ -1164,6 +1166,10 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
         } else {
             load_judge_record(state).await
         };
+        let forecast_inputs = forecasts.as_deref().map(|per_symbol| ForecastInputs {
+            per_symbol,
+            record: state.forecasts().record(settings.timeframe()),
+        });
         let input = proposal_input(
             &entry_markets,
             &judgements,
@@ -1174,6 +1180,7 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
             unix_secs(state.now()),
             policy.max_net_factor_lots(),
             judge_record.as_ref(),
+            forecast_inputs.as_ref(),
         );
         let instructions = proposal_instructions(
             state,
@@ -1181,6 +1188,7 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
             &account,
             state.jev().is_some(),
             judge_record.is_some(),
+            forecast_inputs.as_ref(),
         );
         let engine = model.engine();
         let session = AgentSession {
@@ -1235,6 +1243,7 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
                             DecisionContext {
                                 rationale,
                                 judgements: None,
+                                forecast: None,
                                 tool_names: Some(&tool_names),
                             },
                         )
@@ -1254,6 +1263,9 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
                             DecisionContext {
                                 rationale,
                                 judgements: judgement_for_symbol(&judgements, symbol.as_str()),
+                                forecast: forecasts
+                                    .as_deref()
+                                    .and_then(|held| judgement_for_symbol(held, symbol.as_str())),
                                 tool_names: Some(&tool_names),
                             },
                         )
@@ -1268,6 +1280,9 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
                         let context = DecisionContext {
                             rationale,
                             judgements: judgement_for_symbol(&judgements, symbol.as_str()),
+                            forecast: forecasts
+                                .as_deref()
+                                .and_then(|held| judgement_for_symbol(held, symbol.as_str())),
                             tool_names: Some(&tool_names),
                         };
                         if draft.stop_loss().is_none() || draft.take_profit().is_none() {
@@ -3198,6 +3213,7 @@ async fn review_positions(
     let context = DecisionContext {
         rationale: outcome.rationale.as_deref(),
         judgements,
+        forecast: None,
         tool_names: Some(&tool_names),
     };
     let decision = match outcome.decision {
@@ -3767,6 +3783,8 @@ fn round4(value: f64) -> f64 {
 struct DecisionContext<'a> {
     rationale: Option<&'a str>,
     judgements: Option<&'a Value>,
+    /// The decided instrument's range forecast, when the model was shown one.
+    forecast: Option<&'a Value>,
     /// Read-only agent tools used before this decision, in call order.
     tool_names: Option<&'a [String]>,
 }
@@ -3886,6 +3904,9 @@ async fn record_symbol_event_context(
     if let Some(judgements) = context.judgements {
         payload["judgements"] = judgements.clone();
     }
+    if let Some(forecast) = context.forecast {
+        payload["forecast"] = forecast.clone();
+    }
     if let Some(names) = context.tool_names
         && !names.is_empty()
     {
@@ -3978,6 +3999,9 @@ async fn record_event_context(
     }
     if let Some(judgements) = context.judgements {
         payload["judgements"] = judgements.clone();
+    }
+    if let Some(forecast) = context.forecast {
+        payload["forecast"] = forecast.clone();
     }
     if let Some(names) = context.tool_names
         && !names.is_empty()
@@ -4106,7 +4130,9 @@ fn market_narrative(series: &CandleSeries) -> String {
 /// carries the book's net lots per asset and, on each instrument, the sides
 /// the cap would refuse at the smallest tradable volume, so the model does not
 /// spend an answer on an entry the gate is certain to reject. With a judge
-/// record, the input carries it as `judge_record`.
+/// record, the input carries it as `judge_record`. With a forecaster, every
+/// instrument carries its `forecast` (or `"unavailable"`) and the input the
+/// scored `forecast_record` once there is one.
 #[allow(clippy::too_many_arguments)]
 fn proposal_input(
     markets: &[(Symbol, CandleSeries)],
@@ -4118,6 +4144,7 @@ fn proposal_input(
     now: i64,
     factor_cap: f64,
     judge_record: Option<&JudgeRecord>,
+    forecasts: Option<&ForecastInputs<'_>>,
 ) -> String {
     let assets: Vec<Value> = markets
         .iter()
@@ -4194,6 +4221,11 @@ fn proposal_input(
             if let Some(summary) = judgement_for_symbol(judgements, symbol.as_str()) {
                 asset["judgements"] = summary.clone();
             }
+            if let Some(forecasts) = forecasts {
+                asset["forecast"] = judgement_for_symbol(forecasts.per_symbol, symbol.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| json!(FORECAST_UNAVAILABLE));
+            }
             if let Some(position) = managed
                 .iter()
                 .find(|position| position.symbol.eq_ignore_ascii_case(symbol.as_str()))
@@ -4265,6 +4297,9 @@ fn proposal_input(
     if let Some(record) = judge_record {
         input["judge_record"] = record.to_value();
     }
+    if let Some(record) = forecasts.and_then(|forecasts| forecasts.record.as_ref()) {
+        input["forecast_record"] = record.clone();
+    }
     input.to_string()
 }
 
@@ -4275,6 +4310,7 @@ fn proposal_instructions(
     account: &AccountFacts,
     judge: bool,
     judge_record: bool,
+    forecasts: Option<&ForecastInputs<'_>>,
 ) -> String {
     let policy = state.risk().policy();
     let menu = markets
@@ -4283,7 +4319,7 @@ fn proposal_instructions(
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "You are the analyst for Veyra, a systematic multi-asset trading bot. You are given a menu of          instruments ({menu}) with recent {timeframe} candles{judged_inputs}; the last          candle of each block is the most recent closed bar.{judge_note}\n         Decide for each instrument independently whether the evidence justifies opening a position right          now. You may open at most one instrument per answer. If none of them is suitable, answer `none`          \u{2014} skipping is normal and expected, and every instrument is reconsidered on the next tick.\n         Use the symbol exactly as written. Constraints: at most {max_orders} open orders and {max_total}          lots total exposure ({open_lots} lots currently open), one position per instrument, and volume at          most {max_volume} lots. If you open, use a market order \u{2014} omit `price` entirely \u{2014} with          both `stop_loss` and `take_profit` as absolute prices bracketing the entry, and stay within the          instrument's own price scale. Omit `comment` entirely (the bot annotates orders itself). A          deterministic risk gate re-validates everything and will reject anything outside these limits;          rejections are expected outcomes, not errors.{exposure_rule} Each asset reports its venue contract \u{2014} spread and stop level in points, lot band and step, margin per lot \u{2014} plus ATR(14); size the volume and stop distance so the order lands on the lot grid, fits the free margin shown in the account block, and keeps the stop outside the spread and the minimum stop level. High-impact events blackout entries for their currencies around the release, and the risk gate enforces that window itself; the `upcoming_events` list shows what is scheduled. A release more than about an hour away is not a reason to skip a setup that otherwise qualifies: the attached stop caps the risk through it. Weigh an event only when it is due within the next hour or so. Always include a short `rationale` (at most 280 characters) explaining why this instrument and direction `-` or, when answering none, why no instrument qualifies; the operator sees it in the decision journal. Before answering you may call read-only tools: {judgement_tool}get_market(symbol, timeframe?, bars?) for another window, get_account(), get_positions(), get_market_window() for session and rollover state, and check_risk(intent) to dry-run a draft through the deterministic gate. Call a tool only when its result would change your decision; otherwise answer none or open.",
+        "You are the analyst for Veyra, a systematic multi-asset trading bot. You are given a menu of          instruments ({menu}) with recent {timeframe} candles{judged_inputs}; the last          candle of each block is the most recent closed bar.{judge_note}{forecast_note}\n         Decide for each instrument independently whether the evidence justifies opening a position right          now. You may open at most one instrument per answer. If none of them is suitable, answer `none`          \u{2014} skipping is normal and expected, and every instrument is reconsidered on the next tick.\n         Use the symbol exactly as written. Constraints: at most {max_orders} open orders and {max_total}          lots total exposure ({open_lots} lots currently open), one position per instrument, and volume at          most {max_volume} lots. If you open, use a market order \u{2014} omit `price` entirely \u{2014} with          both `stop_loss` and `take_profit` as absolute prices bracketing the entry, and stay within the          instrument's own price scale. Omit `comment` entirely (the bot annotates orders itself). A          deterministic risk gate re-validates everything and will reject anything outside these limits;          rejections are expected outcomes, not errors.{exposure_rule} Each asset reports its venue contract \u{2014} spread and stop level in points, lot band and step, margin per lot \u{2014} plus ATR(14); size the volume and stop distance so the order lands on the lot grid, fits the free margin shown in the account block, and keeps the stop outside the spread and the minimum stop level. High-impact events blackout entries for their currencies around the release, and the risk gate enforces that window itself; the `upcoming_events` list shows what is scheduled. A release more than about an hour away is not a reason to skip a setup that otherwise qualifies: the attached stop caps the risk through it. Weigh an event only when it is due within the next hour or so. Always include a short `rationale` (at most 280 characters) explaining why this instrument and direction `-` or, when answering none, why no instrument qualifies; the operator sees it in the decision journal. Before answering you may call read-only tools: {judgement_tool}get_market(symbol, timeframe?, bars?) for another window, get_account(), get_positions(), get_market_window() for session and rollover state, and check_risk(intent) to dry-run a draft through the deterministic gate. Call a tool only when its result would change your decision; otherwise answer none or open.",
         menu = menu,
         timeframe = markets
             .first()
@@ -4305,6 +4341,7 @@ fn proposal_instructions(
         },
         exposure_rule = exposure_rule(policy.max_net_factor_lots()),
         judge_note = judge_note(judge, judge_record),
+        forecast_note = forecast_note(forecasts),
     )
 }
 
@@ -4320,6 +4357,114 @@ fn judge_note(judge: bool, record: bool) -> &'static str {
             " The trend readings come from a second model that sees only a one-line summary of each window (first and last close, high, low, change, and the last three closes): `direction` says which way the price has already moved, and its probabilities grow with the size of that move. They describe the move so far; they are not odds that a trade will win. `judge_record` shows how the trades opened on each band of readings under the current timeframe have actually done: how many won, and their average result in multiples of the risk taken (`average_r`; below zero loses money). Weigh a reading by that record, not by its size."
         }
     }
+}
+
+/// The instructions' account of the range forecasts and of their record;
+/// nothing without a forecaster.
+fn forecast_note(forecasts: Option<&ForecastInputs<'_>>) -> String {
+    let Some(forecasts) = forecasts else {
+        return String::new();
+    };
+    let horizon = RangeRequest::HORIZON_BARS;
+    let mut note = format!(
+        " Each instrument's `forecast` comes from a third model that reads only that instrument's candles and estimates the next {horizon} candles: the highest high (`high`), the lowest low (`low`) and the last close (`close`), each as a `median` with an 80% interval from `p10` to `p90`. They are estimates, not facts. `{FORECAST_UNAVAILABLE}` means no forecast was made this time and says nothing about the instrument."
+    );
+    if forecasts.record.is_some() {
+        note.push_str(" `forecast_record` scores earlier forecasts on this timeframe against what price then did: for sound forecasts about 10% of outcomes land below `p10`, 80% inside and 10% above `p90`, and `close_direction_right` is how often the median close pointed the way price closed (0.5 is a coin flip). Rely on the ranges only as far as that record supports them.");
+    } else {
+        note.push_str(
+            " None has been scored against an outcome yet, so their accuracy is unknown.",
+        );
+    }
+    note
+}
+
+/// What an instrument's `forecast` reads when none was made this tick.
+const FORECAST_UNAVAILABLE: &str = "unavailable";
+/// Most forecasts asked at once; larger menus are asked in batches.
+const FORECAST_BATCH: usize = 8;
+
+/// Forecast inputs for one entry proposal: each market's forecast (or
+/// [`FORECAST_UNAVAILABLE`]) and the scored record for the timeframe.
+struct ForecastInputs<'a> {
+    per_symbol: &'a [(Symbol, Value)],
+    record: Option<Value>,
+}
+
+/// Each market's range forecast for its newest candle, or
+/// [`FORECAST_UNAVAILABLE`]; `None` without a configured forecaster.
+///
+/// Waiting forecasts are scored first, against the candles this tick already
+/// fetched. A forecast held for the same newest candle is reused, so each
+/// instrument costs one call per candle, and the calls for a new candle run
+/// concurrently. A failure is logged and not asked again for
+/// [`crate::forecast::record::RETRY_AFTER_SECS`]; nothing here stops the tick.
+async fn range_forecasts(
+    state: &AppState,
+    markets: &[(Symbol, CandleSeries)],
+) -> Option<Vec<(Symbol, Value)>> {
+    let runtime = state.forecast()?;
+    let book = state.forecasts();
+    let now = unix_secs(state.now());
+    let mut asks = Vec::new();
+    for (symbol, series) in markets {
+        book.resolve(series);
+        let candle_time = series.last().map(|candle| candle.time()).unwrap_or(0);
+        if book
+            .held(symbol.as_str(), series.timeframe(), candle_time)
+            .is_some()
+            || !book.may_ask(symbol.as_str(), now)
+        {
+            continue;
+        }
+        match RangeRequest::from_series(series, RangeRequest::HORIZON_BARS) {
+            Ok(request) => asks.push(request),
+            Err(error) => {
+                tracing::warn!(symbol = symbol.as_str(), %error, "range forecast cannot be asked");
+                book.failed(symbol.as_str(), now);
+            }
+        }
+    }
+    let mut asks = asks.into_iter().peekable();
+    while asks.peek().is_some() {
+        let calls: Vec<_> = asks
+            .by_ref()
+            .take(FORECAST_BATCH)
+            .map(|request| {
+                let runtime = runtime.clone();
+                actix_web::rt::spawn(async move {
+                    let result = runtime.forecast(&request).await;
+                    (request, result)
+                })
+            })
+            .collect();
+        for call in calls {
+            match call.await {
+                Ok((_, Ok(forecast))) => book.hold(forecast),
+                Ok((request, Err(error))) => {
+                    tracing::warn!(
+                        symbol = request.symbol().as_str(),
+                        %error,
+                        "range forecast unavailable; the model sees it as unavailable"
+                    );
+                    book.failed(request.symbol().as_str(), now);
+                }
+                Err(error) => tracing::warn!(%error, "range forecast task failed"),
+            }
+        }
+    }
+    Some(
+        markets
+            .iter()
+            .map(|(symbol, series)| {
+                let candle_time = series.last().map(|candle| candle.time()).unwrap_or(0);
+                let forecast = book
+                    .held(symbol.as_str(), series.timeframe(), candle_time)
+                    .map_or_else(|| json!(FORECAST_UNAVAILABLE), |held| held.to_value());
+                (symbol.clone(), forecast)
+            })
+            .collect(),
+    )
 }
 
 /// Longest wait for the judge record before the entry sweep goes on without it.
@@ -5825,6 +5970,12 @@ mod tests {
                 && !requests[0].instructions.contains("judge_record"),
             "without a ledger there is no record to show"
         );
+        assert!(
+            input["assets"][0].get("forecast").is_none()
+                && input.get("forecast_record").is_none()
+                && !requests[0].instructions.contains("forecast"),
+            "without a forecaster nothing mentions forecasts"
+        );
         assert_eq!(input["assets"][0]["market"]["bars"], 20);
         assert_eq!(
             input["assets"][0]["market"]["atr14"], 0.02,
@@ -5836,6 +5987,151 @@ mod tests {
         );
         assert_eq!(input["assets"][0]["contract"]["lot_min"], 0.01);
         assert_eq!(input["assets"][0]["contract"]["stop_level_points"], 5);
+    }
+
+    /// A harness over 30 candles with `forecaster` attached.
+    fn forecast_harness(
+        engine: Arc<StubEngine>,
+        forecaster: Arc<crate::forecast::tests::StubForecaster>,
+    ) -> Rig {
+        let mut harness = build_harness(
+            enabled_settings(),
+            Some(engine),
+            Some(StubFeed {
+                bars: 30,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        harness.state = harness.state.clone().with_forecast(Some(
+            crate::forecast::ForecastRuntime::from_forecaster(forecaster),
+        ));
+        harness
+    }
+
+    #[actix_web::test]
+    async fn tick_feeds_range_forecasts_and_their_record_into_the_model_input() {
+        let engine = StubEngine::answering(json!({"action": "none"}));
+        let forecaster =
+            crate::forecast::tests::StubForecaster::answering(crate::forecast::tests::estimates());
+        let harness = forecast_harness(engine.clone(), forecaster.clone());
+
+        // A forecast made ten candles ago, whose horizon has since closed.
+        let feed = harness.state.market().expect("market").feed();
+        let series = feed
+            .candles(
+                CandleRequest::new(
+                    Symbol::parse("EURUSD").expect("symbol"),
+                    enabled_settings().timeframe(),
+                    30,
+                )
+                .expect("request"),
+            )
+            .await
+            .expect("candles");
+        let earlier = CandleSeries::from_validated(
+            series.symbol().clone(),
+            series.timeframe(),
+            series.candles()[..20].to_vec(),
+        );
+        harness
+            .state
+            .forecasts()
+            .hold(crate::forecast::Forecast::new(
+                &RangeRequest::from_series(&earlier, RangeRequest::HORIZON_BARS).expect("request"),
+                &crate::forecast::tests::estimates(),
+            ));
+
+        assert_eq!(tick(&harness.state).await, TickOutcome::NoTrade);
+        let asked = forecaster.requests();
+        assert_eq!(asked.len(), 1, "one call, for the newest candle");
+        assert_eq!(asked[0].candle_time(), series.last().expect("last").time());
+
+        let requests = engine.requests();
+        let input: Value = serde_json::from_str(&requests[0].input).expect("input is JSON");
+        assert_eq!(
+            input["assets"][0]["forecast"],
+            json!({
+                "horizon_bars": 6,
+                "high": {"p10": 1.15, "median": 1.152, "p90": 1.155},
+                "low": {"p10": 1.14, "median": 1.143, "p90": 1.145},
+                "close": {"p10": 1.142, "median": 1.148, "p90": 1.153}
+            })
+        );
+        assert_eq!(
+            input["forecast_record"]["scored"], 1,
+            "the earlier forecast was scored against the candles after it"
+        );
+        let instructions = &requests[0].instructions;
+        assert!(
+            instructions.contains("third model")
+                && instructions.contains("estimates, not facts")
+                && instructions.contains("`forecast_record` scores earlier forecasts"),
+            "the instructions say what the forecasts and their record are: {instructions}"
+        );
+
+        let _ = tick(&harness.state).await;
+        assert_eq!(
+            forecaster.requests().len(),
+            1,
+            "the same candle is never forecast twice"
+        );
+        let usage = harness.state.forecast().expect("forecaster").usage();
+        assert_eq!(
+            (usage.calls, usage.failures, usage.input_tokens),
+            (1, 0, 900)
+        );
+    }
+
+    #[actix_web::test]
+    async fn a_failed_forecast_reads_unavailable_and_never_blocks_the_tick() {
+        let engine = StubEngine::answering(json!({"action": "none"}));
+        let forecaster = crate::forecast::tests::StubForecaster::failing("provider down");
+        let harness = forecast_harness(engine.clone(), forecaster.clone());
+
+        assert_eq!(tick(&harness.state).await, TickOutcome::NoTrade);
+        let requests = engine.requests();
+        let input: Value = serde_json::from_str(&requests[0].input).expect("input is JSON");
+        assert_eq!(input["assets"][0]["forecast"], "unavailable");
+        assert!(input.get("forecast_record").is_none());
+        assert!(
+            requests[0].instructions.contains("accuracy is unknown")
+                && requests[0]
+                    .instructions
+                    .contains("`unavailable` means no forecast"),
+            "{}",
+            requests[0].instructions
+        );
+
+        let _ = tick(&harness.state).await;
+        assert_eq!(
+            forecaster.requests().len(),
+            1,
+            "a failed symbol waits before it is asked again"
+        );
+    }
+
+    #[actix_web::test]
+    async fn the_forecast_behind_an_entry_travels_with_the_decision() {
+        let engine = StubEngine::answering(open_proposal(true, "EURUSD"));
+        let forecaster =
+            crate::forecast::tests::StubForecaster::answering(crate::forecast::tests::estimates());
+        let harness = forecast_harness(engine, forecaster);
+        assert!(matches!(
+            tick(&harness.state).await,
+            TickOutcome::Queued { .. }
+        ));
+        let decision = harness
+            .trail
+            .events()
+            .into_iter()
+            .find(|event| event.kind() == AuditKind::ProposalEvaluated)
+            .expect("decision recorded");
+        assert_eq!(decision.payload()["forecast"]["high"]["median"], 1.152);
     }
 
     #[actix_web::test]
@@ -8428,6 +8724,7 @@ mod tests {
             &[],
             now,
             0.0,
+            None,
             None,
         ))
         .expect("input is JSON");

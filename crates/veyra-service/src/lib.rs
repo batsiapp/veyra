@@ -16,6 +16,7 @@ pub mod calendar;
 pub mod config;
 pub mod control;
 pub mod credential;
+pub mod forecast;
 pub mod jev;
 pub mod judge;
 pub mod ledger;
@@ -47,6 +48,7 @@ use audit::AuditRuntime;
 use broker::BrokerRuntime;
 use calendar::CalendarRuntime;
 use config::ServiceConfig;
+use forecast::{ForecastBook, ForecastRuntime};
 use jev::JevRuntime;
 use logs::LogBuffer;
 use market::MarketRuntime;
@@ -80,6 +82,10 @@ pub struct AppState {
     credential_vault: Option<crate::credential::CredentialVault>,
     subscription_auth: crate::subscription_auth::SubscriptionAuthState,
     jev: Option<JevRuntime>,
+    /// Price-range forecaster, when one is configured (see [`crate::forecast`]).
+    forecast: Option<ForecastRuntime>,
+    /// Held, waiting, and scored forecasts behind the forecast record.
+    forecasts: Arc<ForecastBook>,
     /// Operator choice of judge (TypeSafe or OpenAI with Jev fallback).
     judge_control: Option<crate::judge::JudgeControl>,
     audit: Option<AuditRuntime>,
@@ -131,6 +137,8 @@ impl AppState {
             credential_vault: None,
             subscription_auth: crate::subscription_auth::SubscriptionAuthState::new(),
             jev: None,
+            forecast: None,
+            forecasts: Arc::new(ForecastBook::default()),
             judge_control: None,
             audit: None,
             ledger: None,
@@ -268,6 +276,12 @@ impl AppState {
     /// Attaches the configured judgement integration, if any.
     pub fn with_jev(mut self, jev: Option<JevRuntime>) -> Self {
         self.jev = jev;
+        self
+    }
+
+    /// Attaches the configured forecaster, if any.
+    pub fn with_forecast(mut self, forecast: Option<ForecastRuntime>) -> Self {
+        self.forecast = forecast;
         self
     }
 
@@ -478,6 +492,16 @@ impl AppState {
     /// [`crate::judge`]); callers need not know which one it is.
     pub fn jev(&self) -> Option<&JevRuntime> {
         self.jev.as_ref()
+    }
+
+    /// Returns the configured forecaster, if any.
+    pub fn forecast(&self) -> Option<&ForecastRuntime> {
+        self.forecast.as_ref()
+    }
+
+    /// Held, waiting, and scored forecasts, shared by every clone of the state.
+    pub fn forecasts(&self) -> &Arc<ForecastBook> {
+        &self.forecasts
     }
 
     /// Operator judge selection, when the service was started with one.

@@ -3,7 +3,7 @@
 //! One shared `reqwest` client with an explicit connect timeout and a total
 //! request timeout performs `POST {base}/accounts/{account}/ai/run/@cf/cloudflare/clairic`.
 //! Each request asks three `estimate` fields (`high`, `low`, `close`) over the
-//! candle text of a [`RangeRequest`], bounded by its floor and ceiling on its
+//! candle text of a [`RangeRequest`], bounded per field by its bounds on its
 //! step grid. The REST API wraps model output in Cloudflare's
 //! `{"result", "success", "errors", "messages"}` envelope; the bare model
 //! output is accepted too, and either is validated field by field against the
@@ -66,8 +66,8 @@ fn wire_body(request: &RangeRequest) -> Value {
                 field.as_str().to_owned(),
                 json!({
                     "type": "estimate",
-                    "min": request.floor(),
-                    "max": request.ceiling(),
+                    "min": request.bounds(field).0,
+                    "max": request.bounds(field).1,
                     "step": request.step(),
                     "instructions": request.instructions(field)
                 }),
@@ -123,15 +123,16 @@ fn parse_response(request: &RangeRequest, bytes: &[u8]) -> Result<RangeEstimates
         let estimate = Estimate::new(quantile("p10")?, quantile("median")?, quantile("p90")?)?;
         // The grid is inclusive of both bounds; one step of slack absorbs
         // the provider's own rounding onto it.
-        let low = request.floor() - request.step();
-        let high = request.ceiling() + request.step();
+        let (min, max) = request.bounds(field);
+        let low = min - request.step();
+        let high = max + request.step();
         if estimate.p10() < low || estimate.p90() > high {
             return Err(malformed(format!(
                 "`{name}` interval {}..{} lies outside the requested {}..{}",
                 estimate.p10(),
                 estimate.p90(),
-                request.floor(),
-                request.ceiling()
+                min,
+                max
             )));
         }
         Ok(estimate)
@@ -352,10 +353,14 @@ mod tests {
                     .expect("state")
                     .starts_with("EURUSD H1")
             );
-            for field in ["high", "low", "close"] {
+            for (field, min, max) in [
+                ("high", 1.118, 1.14),
+                ("low", 1.1, 1.122),
+                ("close", 1.1, 1.14),
+            ] {
                 assert_eq!(body["fields"][field]["type"], "estimate", "{field}");
-                assert_eq!(body["fields"][field]["min"], 1.1, "{field}");
-                assert_eq!(body["fields"][field]["max"], 1.14, "{field}");
+                assert_eq!(body["fields"][field]["min"], min, "{field}");
+                assert_eq!(body["fields"][field]["max"], max, "{field}");
                 assert_eq!(body["fields"][field]["step"], 0.0001, "{field}");
             }
             assert!(
@@ -459,6 +464,14 @@ mod tests {
             (
                 "outside the requested",
                 with(&|body| body["answers"]["high"]["p90"] = json!(1.2)),
+            ),
+            (
+                "outside the requested",
+                with(&|body| body["answers"]["high"]["p10"] = json!(1.11)),
+            ),
+            (
+                "outside the requested",
+                with(&|body| body["answers"]["low"]["p90"] = json!(1.13)),
             ),
             ("truncated", with(&|body| body["truncated"] = json!(true))),
             (

@@ -109,6 +109,10 @@ pub enum ForecastError {
 const MIN_CANDLES: usize = RangeRequest::ATR_PERIOD + 1;
 /// Distance from the last close, in ATRs, that bounds every estimate.
 const SPAN_ATR: f64 = 10.0;
+/// How far, in ATRs, the horizon's high may sit below the last close (or its
+/// low above it). The next candle opens at about the last close, so a high
+/// further below it needs a gap the venue's candles rarely show.
+const GAP_ATR: f64 = 1.0;
 /// Estimate grid spacing, in ATRs.
 const GRID_ATR: f64 = 0.05;
 
@@ -149,6 +153,8 @@ pub struct RangeRequest {
     decimals: usize,
     floor: f64,
     ceiling: f64,
+    high_floor: f64,
+    low_ceiling: f64,
     step: f64,
     state: String,
 }
@@ -189,6 +195,8 @@ impl RangeRequest {
         let step = round_to(atr * GRID_ATR, decimals).max(tick);
         let floor = round_to(last_close - SPAN_ATR * atr, decimals).max(step);
         let ceiling = round_to(last_close + SPAN_ATR * atr, decimals);
+        let high_floor = round_to(last_close - GAP_ATR * atr, decimals).max(step);
+        let low_ceiling = round_to(last_close + GAP_ATR * atr, decimals);
 
         let mut lines = Vec::with_capacity(candles.len());
         for candle in candles {
@@ -221,6 +229,8 @@ impl RangeRequest {
             decimals,
             floor,
             ceiling,
+            high_floor,
+            low_ceiling,
             step,
             state,
         })
@@ -256,14 +266,15 @@ impl RangeRequest {
         self.atr
     }
 
-    /// Lowest value any estimate may take.
-    pub fn floor(&self) -> f64 {
-        self.floor
-    }
-
-    /// Highest value any estimate may take.
-    pub fn ceiling(&self) -> f64 {
-        self.ceiling
+    /// Lowest and highest value `field`'s estimate may take: ten ATRs either
+    /// side of the last close, except that the high stays within one ATR
+    /// below it and the low within one ATR above it.
+    pub fn bounds(&self, field: RangeField) -> (f64, f64) {
+        match field {
+            RangeField::High => (self.high_floor, self.ceiling),
+            RangeField::Low => (self.floor, self.low_ceiling),
+            RangeField::Close => (self.floor, self.ceiling),
+        }
     }
 
     /// Estimate grid spacing.
@@ -712,12 +723,17 @@ pub(crate) mod tests {
             "{}",
             request.step()
         );
-        assert!((request.floor() - 1.1).abs() < 1e-9, "{}", request.floor());
-        assert!(
-            (request.ceiling() - 1.14).abs() < 1e-9,
-            "{}",
-            request.ceiling()
-        );
+        for (field, (low, high)) in [
+            (RangeField::High, (1.118, 1.14)),
+            (RangeField::Low, (1.1, 1.122)),
+            (RangeField::Close, (1.1, 1.14)),
+        ] {
+            let (min, max) = request.bounds(field);
+            assert!(
+                (min - low).abs() < 1e-9 && (max - high).abs() < 1e-9,
+                "{field:?}: {min}..{max}"
+            );
+        }
 
         let state = request.state();
         assert!(

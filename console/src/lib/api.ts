@@ -37,6 +37,24 @@ export type AutopilotStatus = {
   } | null
 }
 
+/** Shares of scored forecasts whose outcome fell below, inside, or above the 80% interval. */
+export type ForecastBands = { below_p10: number; inside: number; above_p90: number }
+
+export type ForecastUsage = {
+  calls: number
+  failures: number
+  inputTokens: number
+  /** Null until a forecast's horizon has closed and been scored. */
+  record: {
+    scored: number
+    high: ForecastBands
+    low: ForecastBands
+    close: ForecastBands
+    /** Share of scored forecasts whose median close pointed the way price closed. */
+    close_direction_right?: number
+  } | null
+}
+
 export type Status = {
   service: string
   version: string
@@ -57,6 +75,10 @@ export type Status = {
    * `fallbacks` counts judgements Jev answered because OpenAI failed.
    */
   jev_usage: { calls: number; failures: number; inputTokens: number; outputTokens: number; fallbacks?: number } | null
+  /** Range forecaster in use (`workers-ai`); null or absent without one. */
+  forecast_provider?: string | null
+  /** Forecast usage and the scored record for the autopilot's timeframe; null without a forecaster. */
+  forecast_usage?: ForecastUsage | null
   /** Effective risk gate policy; always present. */
   risk_policy: RiskPolicy
   /**

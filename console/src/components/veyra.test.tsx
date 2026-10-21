@@ -166,7 +166,8 @@ function deferred<T>() {
 
 /** The value cell beside a label in a label/value grid. */
 function valueOf(label: string): HTMLElement {
-  const term = screen.getByText(label, { selector: 'dt' })
+  // A hinted label carries its tip inside the term, so match the label text alone.
+  const term = screen.getByText((_, element) => element?.tagName === 'DT' && element.firstChild?.textContent === label)
   return term.nextElementSibling as HTMLElement
 }
 
@@ -430,6 +431,34 @@ describe('AutopilotPanel', () => {
     expect(valueOf('Judge calls').textContent).toBe('—')
     expect(valueOf('Judge tokens').textContent).toBe('—')
     expect(valueOf('Calls per hour').textContent).toBe('—')
+  })
+
+  it('shows forecast usage and the scored record, or that forecasts are off', () => {
+    const bands = (inside: number) => ({ below_p10: (1 - inside) / 2, inside, above_p90: (1 - inside) / 2 })
+    const { rerender } = render(
+      <AutopilotPanel
+        status={autopilot}
+        forecastUsage={{
+          calls: 57,
+          failures: 2,
+          inputTokens: 161_374,
+          record: { scored: 41, high: bands(0.8), low: bands(0.7), close: bands(0.9), close_direction_right: 0.54 },
+        }}
+      />,
+    )
+    expect(valueOf('Forecast calls').textContent).toBe('57 · 2 failed')
+    expect(valueOf('Forecast calls').className).toBe('tone-warn')
+    expect(valueOf('Forecast tokens').textContent).toBe('161.4k')
+    expect(valueOf('Forecast record').textContent).toBe('41 scored · 80% in range · 54% direction')
+    expect(screen.getByLabelText('About Forecast record')).toBeTruthy()
+
+    rerender(<AutopilotPanel status={autopilot} forecastUsage={{ calls: 57, failures: 0, inputTokens: 161_374, record: null }} />)
+    expect(valueOf('Forecast record').textContent).toBe('Not scored yet')
+    expect(valueOf('Forecast record').className).toBe('tone-faint')
+
+    rerender(<AutopilotPanel status={autopilot} forecastUsage={null} />)
+    expect(valueOf('Forecast calls').textContent).toBe('Off')
+    expect(screen.queryByLabelText('About Forecast record')).toBeNull()
   })
 
   it('names the models last asked and last answering', () => {

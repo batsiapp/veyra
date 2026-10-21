@@ -309,6 +309,7 @@ export function Dashboard() {
                   status={status?.autopilot}
                   budget={status?.model_budget}
                   jevUsage={status?.jev_usage}
+                  forecastUsage={status?.forecast_usage}
                   decisions={status?.decisions}
                 />
                 <div className="tab-stack">

@@ -30,7 +30,8 @@ COPY supervisord.conf /etc/veyra-mt4/supervisord.conf
 COPY run-terminal.sh install-mt4.sh compile-ea.sh /usr/local/bin/
 RUN chmod 755 /usr/local/bin/run-terminal.sh /usr/local/bin/install-mt4.sh /usr/local/bin/compile-ea.sh \
     && ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html \
-    && mkdir -p /home/trader/.wine && chown trader:trader /home/trader/.wine
+    && mkdir -p /home/trader/.wine && chown trader:trader /home/trader/.wine \
+    && mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
 
 USER trader
 WORKDIR /home/trader

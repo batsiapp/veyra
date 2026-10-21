@@ -86,6 +86,8 @@ jobs:
           {
             echo "VEYRA_POSTGRES_PASSWORD=$(openssl rand -hex 16)"
             echo "VEYRA_EA_TOKEN=$(openssl rand -hex 24)"
+            echo "VEYRA_CONSOLE_SECRET_KEY=$(openssl rand -base64 32)"
+            echo "VEYRA_CONSOLE_ADMIN_TOKEN=$(openssl rand -hex 24)"
             echo "VEYRA_IMAGE_TAG=sha-${GITHUB_SHA::7}"
             echo "VEYRA_IMAGE_REGISTRY=${VEYRA_IMAGE_REGISTRY}"
           } >> .env
@@ -115,6 +117,10 @@ jobs:
           done
           ./deploy/vps/veyra.sh logs mt4 | grep 'MT4 not installed yet'
           ./deploy/vps/veyra.sh exec -T mt4 wine cmd /c ver
+          # The watchdog stays up instead of restarting in a loop.
+          sleep 20
+          test "$(docker inspect -f '{{.RestartCount}}' veyra-watchdog-1)" = 0
+          test "$(docker inspect -f '{{.State.Running}}' veyra-watchdog-1)" = true
 
       - name: Logs
         if: always()

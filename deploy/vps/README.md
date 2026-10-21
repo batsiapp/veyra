@@ -70,6 +70,11 @@ VEYRA_POSTGRES_PASSWORD=
 # the add-on's password, from: openssl rand -hex 24
 VEYRA_EA_TOKEN=
 VEYRA_EA_URL=http://172.30.0.20/ea/poll
+# encrypts keys saved from the console, from: openssl rand -base64 32
+# keep it: without it, saved keys and notification settings can't be read
+VEYRA_CONSOLE_SECRET_KEY=
+# the password the console asks for when saving keys, from: openssl rand -hex 24
+VEYRA_CONSOLE_ADMIN_TOKEN=
 # leave false until you've watched it on a demo account
 VEYRA_EA_ALLOW_LIVE=false
 VEYRA_TRADING_ENABLED=false

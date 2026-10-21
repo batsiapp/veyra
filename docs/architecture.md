@@ -280,7 +280,7 @@ Counters and baselines that must survive restarts live in one Postgres table, `r
 | Key | Holds | Loaded into |
 | --- | --- | --- |
 | `jev_usage` | cumulative judge calls, failures, provider-reported tokens, and Jev fallbacks | `/status` and the console's Autopilot panel |
-| `forecast_usage` | cumulative forecast calls, failures, and billed input tokens | `/status` (`forecast_usage`) |
+| `forecast_usage` | cumulative forecast calls, failures, and billed input tokens | `/status` (`forecast_usage`) and the console's Autopilot panel (calls, tokens, and the scored record) |
 | `forecast_book` | forecasts waiting for their horizon and the scored history behind `forecast_record` | `ForecastBook`; the newest waiting forecast per instrument is reused for its candle |
 | `model_budget` | hourly/daily call-window anchors and counts (wall-clock anchored, so restarts cannot reset the budget) | `BudgetedEngine` admission |
 | `equity_baselines` | day anchor, day-start equity and balance, peak equity | drawdown breakers |
@@ -302,7 +302,7 @@ What deliberately stays volatile: the **pending command queue** (replaying undel
 
 Index CFDs (`SP500m`, `Nd100m` at IFC Markets) trade through the same path as FX, with four differences the service handles explicitly:
 
-- **Names.** MT4 names can be mixed-case. Symbols keep the spelling they were given, equality ignores case (`SP500M` = `SP500m`), and an approved order is sent under the allowlist's spelling.
+- **Names.** MT4 names can be mixed-case. Symbols keep the spelling they were given, equality ignores case (`SP500M` = `SP500m`), and an approved order is sent under the terminal's own spelling, taken from the contract it reported for that instrument, or the allowlist's when there is none. The terminal is the authority because a stored allowlist can be stale: one saved by an older build held `SP500M` and `ND100M`, the terminal answers "symbol unavailable" to those, and every index entry failed its final check as `news_unavailable` (no contract, so no currencies to clear the news window) until 2026-10-21.
 - **News.** A symbol that is not a currency pair has no currencies in its name, so the calendar uses the contract's reported base and profit currencies (EA 1.26+: `SP500m` → USD). An instrument whose currencies are unknown is refused with `news_unavailable` whenever a calendar and blackout are configured, and the autopilot does not offer it.
 - **Trading hours.** EA 1.26+ reports each instrument's weekly sessions (`SymbolInfoSessionTrade`, server time). Entries are refused outside a session and within 15 minutes of its close (`instrument_closed`); back-to-back sessions count as one. An instrument that is neither FX nor a metal nor weekend-capable, and reports no sessions, counts as closed.
 - **Correlation.** Index lots are not comparable to FX lots, so each index counts only as its own asset under the exposure cap and money risk is bounded by the per-trade risk cap, and `VEYRA_RISK_CORRELATED_GROUPS` (e.g. `SP500m+Nd100m`) allows at most one open position per group of instruments that move together.

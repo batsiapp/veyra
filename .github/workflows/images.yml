@@ -1,0 +1,123 @@
+name: Images
+
+# Builds the container images the VPS stack (deploy/vps) pulls from GitHub's
+# container registry. The Rust build needs more memory than a small VPS has,
+# so it happens here instead.
+
+on:
+  push:
+    branches: [main, 'claude/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: veyra-service
+            context: .
+            file: Dockerfile
+          - name: veyra-console
+            context: console
+            file: console/Dockerfile
+          - name: veyra-mt4
+            context: deploy/vps/mt4
+            file: deploy/vps/mt4/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=sha
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  # Starts the whole VPS stack from the images just built and checks that each
+  # piece answers: the service, the console, the MT4 screen, and the EA relay.
+  smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      VEYRA_IMAGE_REGISTRY: ghcr.io/${{ github.repository_owner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Minimal settings
+        run: |
+          cp .env.example .env
+          {
+            echo "VEYRA_POSTGRES_PASSWORD=$(openssl rand -hex 16)"
+            echo "VEYRA_EA_TOKEN=$(openssl rand -hex 24)"
+            echo "VEYRA_IMAGE_TAG=sha-${GITHUB_SHA::7}"
+            echo "VEYRA_IMAGE_REGISTRY=${VEYRA_IMAGE_REGISTRY}"
+          } >> .env
+
+      - name: Start the stack
+        run: |
+          ./deploy/vps/veyra.sh pull
+          ./deploy/vps/veyra.sh up -d --wait --wait-timeout 300
+
+      - name: Check every piece answers
+        run: |
+          set -x
+          curl -fsS http://127.0.0.1:8080/health
+          curl -fsS http://127.0.0.1:8080/status
+          curl -fsS -o /dev/null http://127.0.0.1:3000/
+          curl -fsS http://127.0.0.1:3000/api/health
+          curl -fsS -o /dev/null http://127.0.0.1:6080/vnc.html
+          # The EA path: port 80 relay in the mt4 container to veyra:7801.
+          # An empty poll reaching the service is rejected with 400.
+          code=$(./deploy/vps/veyra.sh exec -T mt4 \
+            curl -s -o /dev/null -w '%{http_code}' -X POST http://172.30.0.20/ea/poll)
+          test "$code" = 400
+          # Wine starts and the terminal runner is waiting for an MT4 install.
+          for i in $(seq 1 60); do
+            ./deploy/vps/veyra.sh logs mt4 | grep -q 'MT4 not installed yet' && break
+            sleep 5
+          done
+          ./deploy/vps/veyra.sh logs mt4 | grep 'MT4 not installed yet'
+          ./deploy/vps/veyra.sh exec -T mt4 wine cmd /c ver
+
+      - name: Logs
+        if: always()
+        run: |
+          ./deploy/vps/veyra.sh ps -a
+          ./deploy/vps/veyra.sh logs --tail=80

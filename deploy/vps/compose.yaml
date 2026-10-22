@@ -1,0 +1,177 @@
+# Runs the whole Veyra stack on one small Linux VPS, MetaTrader 4 included.
+#
+# Nothing here is reachable from the internet. Every published port binds to
+# the VPS's own loopback address; reach the console and the MT4 screen through
+# an SSH tunnel (see README.md). MT4 talks to Veyra over the private Compose
+# network, so no domain, tunnel or TLS certificate is needed.
+#
+# Images are built by GitHub Actions (.github/workflows/images.yml) because the
+# Rust build needs more memory than a 1 GB VPS has.
+#
+# Run from the repository root:
+#   docker compose -f deploy/vps/compose.yaml --env-file .env up -d
+name: veyra
+
+x-service-security: &service-security
+  init: true
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  postgres:
+    <<: *logging
+    image: postgres:17-alpine
+    restart: unless-stopped
+    # Sized for a 1 GB machine.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=48MB
+      - -c
+      - max_connections=30
+      - -c
+      - work_mem=2MB
+      - -c
+      - maintenance_work_mem=32MB
+    environment:
+      POSTGRES_DB: veyra
+      POSTGRES_USER: veyra
+      POSTGRES_PASSWORD: ${VEYRA_POSTGRES_PASSWORD:?set VEYRA_POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U veyra -d veyra"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+    networks:
+      - backend
+
+  veyra:
+    <<: [*service-security, *logging]
+    image: ${VEYRA_IMAGE_REGISTRY:-ghcr.io/batsiapp}/veyra-service:${VEYRA_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    environment:
+      VEYRA_ENV: production
+      VEYRA_BIND_HOST: 0.0.0.0
+      VEYRA_BIND_PORT: "8080"
+      VEYRA_DATABASE_URL: postgres://veyra:${VEYRA_POSTGRES_PASSWORD}@postgres:5432/veyra
+      VEYRA_BROKER_PROVIDER: ea
+      # The EA listener is on the private network only, never published.
+      VEYRA_EA_BIND_HOST: 0.0.0.0
+      VEYRA_EA_BIND_PORT: "7801"
+      VEYRA_EA_ALLOW_NON_LOOPBACK: "true"
+      VEYRA_TRADING_ENABLED: ${VEYRA_TRADING_ENABLED:-false}
+      VEYRA_AUTOPILOT_ENABLED: ${VEYRA_AUTOPILOT_ENABLED:-false}
+    ports:
+      # Diagnostics (/health, /ready, /status, /config) for curl on the VPS.
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    networks:
+      - backend
+
+  # Reports outages of the service itself through the notification channels
+  # set up in the console.
+  watchdog:
+    <<: [*service-security, *logging]
+    image: ${VEYRA_IMAGE_REGISTRY:-ghcr.io/batsiapp}/veyra-service:${VEYRA_IMAGE_TAG:-latest}
+    command: ["watchdog"]
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    environment:
+      VEYRA_DATABASE_URL: postgres://veyra:${VEYRA_POSTGRES_PASSWORD}@postgres:5432/veyra
+      VEYRA_WATCHDOG_URL: http://veyra:8080
+    depends_on:
+      postgres:
+        condition: service_started
+    networks:
+      - backend
+
+  console:
+    <<: [*service-security, *logging]
+    image: ${VEYRA_IMAGE_REGISTRY:-ghcr.io/batsiapp}/veyra-console:${VEYRA_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      veyra:
+        condition: service_healthy
+    environment:
+      VEYRA_API_TARGET: http://veyra:8080
+      NODE_OPTIONS: --max-old-space-size=160
+    ports:
+      # Open through the SSH tunnel: http://127.0.0.1:3000
+      - "127.0.0.1:3000:3000"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--output-document=/dev/null", "http://127.0.0.1:3000/"]
+      interval: 15s
+      timeout: 3s
+      retries: 12
+    tmpfs:
+      - /app/node_modules/.vite-temp:size=8m,uid=1000,gid=1000,mode=0755
+      - /tmp:size=16m,mode=1777
+    networks:
+      - backend
+
+  # MetaTrader 4 under Wine, shown in the browser through noVNC.
+  #
+  # MQL4 WebRequest only uses port 80 for http:// and the service only listens
+  # on ports from 1024 up, so a relay in this container forwards port 80 to
+  # veyra:7801. The EA calls http://172.30.0.20/ea/poll: a fixed private
+  # address, so the URL compiled into the EA never changes.
+  mt4:
+    <<: *logging
+    image: ${VEYRA_IMAGE_REGISTRY:-ghcr.io/batsiapp}/veyra-mt4:${VEYRA_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    shm_size: 128m
+    environment:
+      VEYRA_EA_UPSTREAM: veyra:7801
+    # Lets the non-root relay bind port 80 inside this container's own network
+    # namespace without any added capability.
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "80"
+    volumes:
+      - mt4-wine:/home/trader/.wine
+    ports:
+      # Open through the SSH tunnel: http://127.0.0.1:6080
+      - "127.0.0.1:6080:6080"
+    networks:
+      backend:
+        ipv4_address: 172.30.0.20
+
+volumes:
+  postgres-data:
+    name: veyra-postgres-data
+  mt4-wine:
+    name: veyra-mt4-wine
+
+networks:
+  backend:
+    name: veyra-backend
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

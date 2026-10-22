@@ -48,7 +48,7 @@ Run everything with one command before you commit:
 ./scripts/check.sh
 ```
 
-It runs the same steps as CI (`.github/workflows/quality.yml`):
+It runs these quality checks:
 
 - **Rust:** `cargo fmt --all -- --check`, `cargo clippy --all-targets
   --all-features -- -D warnings`, `cargo test --all-targets`, and

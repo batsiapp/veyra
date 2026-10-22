@@ -78,7 +78,7 @@ What exists and what has been proven live:
   configured but unreachable database fails startup.
 - Structured JSON logging, bind-failure propagation, and graceful shutdown.
 - Rust unit, integration, and line-coverage gates.
-- GitHub Actions quality workflow.
+- GitHub Actions image builds with a full-stack smoke test (`.github/workflows/images.yml`).
 - Architecture and roadmap documentation.
 
 Real orders require two controls: the service switch
